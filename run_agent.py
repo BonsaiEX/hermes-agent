@@ -1057,12 +1057,35 @@ class AIAgent:
             else:
                 # No explicit creds — use the centralized provider router
                 from agent.auxiliary_client import resolve_provider_client
-                _routed_client, _ = resolve_provider_client(
+                _routed_client, _resolved_model = resolve_provider_client(
                     self.provider or "auto", model=self.model, raw_codex=True)
                 if _routed_client is not None:
+                    _resolved_base_url = str(_routed_client.base_url)
+                    # router が確定した runtime 情報を primary state に戻す。
+                    # 未確定初期化では base_url だけが埋まり、model/provider が
+                    # 空のまま残ると _primary_runtime も不整合になる。
+                    if _resolved_model and not self.model:
+                        self.model = _resolved_model
+                    if not self.provider:
+                        _resolved_base_lower = _resolved_base_url.lower()
+                        if "openrouter" in _resolved_base_lower:
+                            self.provider = "openrouter"
+                        elif "chatgpt.com/backend-api/codex" in _resolved_base_lower:
+                            self.provider = "openai-codex"
+                        elif "api.x.ai" in _resolved_base_lower:
+                            self.provider = "xai"
+                        elif (
+                            "api.anthropic.com" in _resolved_base_lower
+                            or _resolved_base_lower.rstrip("/").endswith("/anthropic")
+                        ):
+                            self.provider = "anthropic"
+                        elif "bedrock-runtime" in _resolved_base_lower:
+                            self.provider = "bedrock"
+                        elif _resolved_base_url:
+                            self.provider = "custom"
                     client_kwargs = {
                         "api_key": _routed_client.api_key,
-                        "base_url": str(_routed_client.base_url),
+                        "base_url": _resolved_base_url,
                     }
                     # Preserve any default_headers the router set
                     if hasattr(_routed_client, '_default_headers') and _routed_client._default_headers:

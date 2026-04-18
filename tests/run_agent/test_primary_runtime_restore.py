@@ -112,6 +112,71 @@ class TestPrimaryRuntimeSnapshot:
         rt = agent._primary_runtime
         assert "anthropic_api_key" not in rt
 
+    @pytest.mark.parametrize(
+        ("provider", "resolved_model", "resolved_base_url", "expected_provider"),
+        [
+            (
+                None,
+                "minimax/minimax-m2.5",
+                "https://openrouter.ai/api/v1",
+                "openrouter",
+            ),
+            (
+                None,
+                "qwen2.5-coder:14b",
+                "http://localhost:11434/v1",
+                "custom",
+            ),
+            (
+                "openrouter",
+                "google/gemini-2.5-flash",
+                "https://openrouter.ai/api/v1",
+                "openrouter",
+            ),
+        ],
+    )
+    def test_snapshot_reflects_routed_runtime_state(
+        self,
+        provider,
+        resolved_model,
+        resolved_base_url,
+        expected_provider,
+    ):
+        """Router の解決結果が primary state に反映されることを確認する。"""
+        mock_client = _mock_resolve(
+            base_url=resolved_base_url,
+            api_key="resolved-key-1234",
+        )
+
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch("run_agent.fetch_model_metadata", return_value={}),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(mock_client, resolved_model),
+            ),
+        ):
+            agent = AIAgent(
+                model="",
+                provider=provider,
+                base_url=None,
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        assert agent.model == resolved_model
+        assert agent.provider == expected_provider
+        assert agent.base_url == resolved_base_url
+        assert agent._fallback_chain == []
+
+        rt = agent._primary_runtime
+        assert rt["model"] == resolved_model
+        assert rt["provider"] == expected_provider
+        assert rt["base_url"] == resolved_base_url
+
 
 # =============================================================================
 # _restore_primary_runtime()
