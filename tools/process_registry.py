@@ -46,6 +46,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from hermes_cli.config import get_hermes_home
+from tools.environments.base import _rewrite_command_for_rtk
 
 logger = logging.getLogger(__name__)
 
@@ -333,6 +334,7 @@ class ProcessRegistry:
             cwd=cwd or os.getcwd(),
             started_at=time.time(),
         )
+        rewritten_command = _rewrite_command_for_rtk(command)
 
         if use_pty:
             # Try PTY mode for interactive CLI tools
@@ -345,7 +347,7 @@ class ProcessRegistry:
                 pty_env = _sanitize_subprocess_env(os.environ, env_vars)
                 pty_env["PYTHONUNBUFFERED"] = "1"
                 pty_proc = _PtyProcessCls.spawn(
-                    [user_shell, "-lic", f"set +m; {command}"],
+                    [user_shell, "-lic", f"set +m; {rewritten_command}"],
                     cwd=session.cwd,
                     env=pty_env,
                     dimensions=(30, 120),
@@ -386,7 +388,7 @@ class ProcessRegistry:
         bg_env = _sanitize_subprocess_env(os.environ, env_vars)
         bg_env["PYTHONUNBUFFERED"] = "1"
         proc = subprocess.Popen(
-            [user_shell, "-lic", f"set +m; {command}"],
+            [user_shell, "-lic", f"set +m; {rewritten_command}"],
             text=True,
             cwd=session.cwd,
             env=bg_env,
@@ -454,7 +456,8 @@ class ProcessRegistry:
         log_path = f"{temp_dir}/hermes_bg_{session.id}.log"
         pid_path = f"{temp_dir}/hermes_bg_{session.id}.pid"
         exit_path = f"{temp_dir}/hermes_bg_{session.id}.exit"
-        quoted_command = shlex.quote(command)
+        rewritten_command = _rewrite_command_for_rtk(command)
+        quoted_command = shlex.quote(rewritten_command)
         quoted_temp_dir = shlex.quote(temp_dir)
         quoted_log_path = shlex.quote(log_path)
         quoted_pid_path = shlex.quote(pid_path)
