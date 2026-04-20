@@ -697,7 +697,12 @@ class TestIsConnectionError:
 
 
 class TestKimiForCodingTemperature:
-    """kimi-for-coding now requires temperature=0.6 exactly."""
+    """Moonshot kimi-for-coding models require fixed temperatures.
+
+    k2.5 / k2-turbo-preview / k2-0905-preview → 0.6 (non-thinking lock).
+    k2-thinking / k2-thinking-turbo → 1.0 (thinking lock).
+    kimi-k2-instruct* and every other model preserve the caller's temperature.
+    """
 
     def test_build_call_kwargs_forces_fixed_temperature(self):
         from agent.auxiliary_client import _build_call_kwargs
@@ -772,17 +777,146 @@ class TestKimiForCodingTemperature:
         assert kwargs["model"] == "kimi-for-coding"
         assert kwargs["temperature"] == 0.6
 
-    def test_non_kimi_model_still_preserves_temperature(self):
+    @pytest.mark.parametrize(
+        "model,expected",
+        [
+            ("kimi-k2.5", 0.6),
+            ("kimi-k2-turbo-preview", 0.6),
+            ("kimi-k2-0905-preview", 0.6),
+            ("kimi-k2-thinking", 1.0),
+            ("kimi-k2-thinking-turbo", 1.0),
+            ("moonshotai/kimi-k2.5", 0.6),
+            ("moonshotai/Kimi-K2-Thinking", 1.0),
+        ],
+    )
+    def test_kimi_k2_family_temperature_override(self, model, expected):
+        """Moonshot kimi-k2.* models only accept fixed temperatures.
+
+        Non-thinking models → 0.6, thinking-mode models → 1.0.
+        """
+        from agent.auxiliary_client import _build_call_kwargs
+
+        kwargs = _build_call_kwargs(
+            provider="kimi-coding",
+            model=model,
+            messages=[{"role": "user", "content": "hello"}],
+            temperature=0.3,
+        )
+
+        assert kwargs["temperature"] == expected
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "anthropic/claude-sonnet-4-6",
+            "gpt-5.4",
+            # kimi-k2-instruct is the non-coding K2 family — temperature is
+            # variable (recommended 0.6 but not enforced).  Must not clamp.
+            "kimi-k2-instruct",
+            "moonshotai/Kimi-K2-Instruct",
+            "moonshotai/Kimi-K2-Instruct-0905",
+            "kimi-k2-instruct-0905",
+            # Hypothetical future kimi name not in the whitelist.
+            "kimi-k2-experimental",
+        ],
+    )
+    def test_non_restricted_model_preserves_temperature(self, model):
+        from agent.auxiliary_client import _build_call_kwargs
+
+        kwargs = _build_call_kwargs(
+            provider="openrouter",
+            model=model,
+            messages=[{"role": "user", "content": "hello"}],
+            temperature=0.3,
+        )
+
+        assert kwargs["temperature"] == 0.3
+
+    # ── Endpoint-aware overrides: api.moonshot.ai vs api.kimi.com/coding ──
+    # The public Moonshot chat endpoint and the Coding Plan endpoint enforce
+    # different temperature contracts for the same model name.  `kimi-k2.5` on
+    # api.moonshot.ai rejects 0.6 with HTTP 400 "only 1 is allowed for this
+    # model", while the Coding Plan docs mandate 0.6.  Override must pick the
+    # right value per base_url.
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "https://api.moonshot.ai/v1",
+            "https://api.moonshot.ai/v1/",
+            "https://API.MOONSHOT.AI/v1",
+        ],
+    )
+    def test_kimi_k2_5_public_api_forces_temperature_1(self, base_url):
+        """kimi-k2.5 on the public Moonshot API only accepts temperature=1."""
         from agent.auxiliary_client import _build_call_kwargs
 
         kwargs = _build_call_kwargs(
             provider="kimi-coding",
             model="kimi-k2.5",
             messages=[{"role": "user", "content": "hello"}],
-            temperature=0.3,
+            temperature=0.1,
+            base_url=base_url,
         )
 
-        assert kwargs["temperature"] == 0.3
+        assert kwargs["temperature"] == 1.0
+
+    def test_kimi_k2_5_coding_plan_keeps_temperature_0_6(self):
+        """kimi-k2.5 on api.kimi.com/coding keeps the Coding Plan's 0.6 lock."""
+        from agent.auxiliary_client import _build_call_kwargs
+
+        kwargs = _build_call_kwargs(
+            provider="kimi-coding",
+            model="kimi-k2.5",
+            messages=[{"role": "user", "content": "hello"}],
+            temperature=0.1,
+            base_url="https://api.kimi.com/coding/v1",
+        )
+
+        assert kwargs["temperature"] == 0.6
+
+    def test_kimi_k2_5_no_base_url_falls_back_to_coding_plan_lock(self):
+        """Without a base_url hint, the Coding Plan default (0.6) applies.
+
+        Preserves PR #12144 backward compatibility for callers that don't thread
+        the client's base_url through.
+        """
+        from agent.auxiliary_client import _build_call_kwargs
+
+        kwargs = _build_call_kwargs(
+            provider="kimi-coding",
+            model="kimi-k2.5",
+            messages=[{"role": "user", "content": "hello"}],
+            temperature=0.1,
+        )
+
+        assert kwargs["temperature"] == 0.6
+
+    @pytest.mark.parametrize(
+        "model,expected",
+        [
+            # Only kimi-k2.5 diverges on api.moonshot.ai; the rest keep the
+            # Coding Plan lock (empirically verified against Moonshot in April
+            # 2026: turbo-preview accepts 0.6, thinking-turbo accepts 1.0).
+            ("kimi-k2-turbo-preview", 0.6),
+            ("kimi-k2-0905-preview", 0.6),
+            ("kimi-k2-thinking", 1.0),
+            ("kimi-k2-thinking-turbo", 1.0),
+            ("moonshotai/kimi-k2-thinking-turbo", 1.0),
+        ],
+    )
+    def test_other_kimi_k2_family_unchanged_on_public_api(self, model, expected):
+        from agent.auxiliary_client import _build_call_kwargs
+
+        kwargs = _build_call_kwargs(
+            provider="kimi-coding",
+            model=model,
+            messages=[{"role": "user", "content": "hello"}],
+            temperature=0.1,
+            base_url="https://api.moonshot.ai/v1",
+        )
+
+        assert kwargs["temperature"] == expected
 
 
 # ---------------------------------------------------------------------------
