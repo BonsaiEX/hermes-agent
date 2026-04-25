@@ -10,6 +10,7 @@ import codecs
 import json
 import logging
 import os
+import re
 import select
 import shlex
 import subprocess
@@ -156,6 +157,46 @@ def _file_mtime_key(host_path: str) -> tuple[float, int] | None:
         return (st.st_mtime, st.st_size)
     except OSError:
         return None
+
+
+_RTK_ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+_RTK_COMPLEX_SHELL_MARKERS = ("&&", "||", "|", ";", "\n", "$(", "`", "<<", ">>", "<", ">", "&")
+
+
+def _rewrite_command_for_rtk(command: str) -> str:
+    """単純なコマンドだけをRTK経由に書き換える。"""
+    raw_command = command.strip()
+    if not raw_command:
+        return command
+    if raw_command == "rtk" or raw_command.startswith("rtk "):
+        return command
+    if any(marker in command for marker in _RTK_COMPLEX_SHELL_MARKERS):
+        return command
+
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return command
+
+    if not tokens:
+        return command
+    if tokens[0] == "rtk":
+        return command
+    if any(_RTK_ENV_ASSIGNMENT_RE.match(token) for token in tokens):
+        return command
+
+    quoted_rtk_command = " ".join(shlex.quote(token) for token in ["rtk", *tokens])
+    return (
+        "if command -v rtk >/dev/null 2>&1; then "
+        f"{quoted_rtk_command}; "
+        "__hermes_rtk_ec=$?; "
+        'if [ "$__hermes_rtk_ec" -ne 0 ]; then '
+        f"{command}; "
+        "fi; "
+        "else "
+        f"{command}; "
+        "fi"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -373,17 +414,6 @@ class BaseEnvironment(ABC):
     # Command wrapping
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _quote_cwd_for_cd(cwd: str) -> str:
-        """Quote a ``cd`` target while preserving ``~`` expansion."""
-        if cwd == "~":
-            return cwd
-        if cwd == "~/":
-            return "$HOME"
-        if cwd.startswith("~/"):
-            return f"$HOME/{shlex.quote(cwd[2:])}"
-        return shlex.quote(cwd)
-
     def _wrap_command(self, command: str, cwd: str) -> str:
         """Build the full bash script that sources snapshot, cd's, runs command,
         re-dumps env vars, and emits CWD markers."""
@@ -402,10 +432,11 @@ class BaseEnvironment(ABC):
                 f"source {self._snapshot_path} >/dev/null 2>&1 || true"
             )
 
-        # Preserve bare ``~`` expansion, but rewrite ``~/...`` through
-        # ``$HOME`` so suffixes with spaces remain a single shell word.
-        quoted_cwd = self._quote_cwd_for_cd(cwd)
-        parts.append(f"builtin cd {quoted_cwd} || exit 126")
+        # cd to working directory — let bash expand ~ natively
+        quoted_cwd = (
+            shlex.quote(cwd) if cwd != "~" and not cwd.startswith("~/") else cwd
+        )
+        parts.append(f"cd {quoted_cwd} || exit 126")
 
         # Run the actual command
         parts.append(f"eval '{escaped}'")
@@ -778,8 +809,10 @@ class BaseEnvironment(ABC):
             pass
 
     def _prepare_command(self, command: str) -> tuple[str, str | None]:
-        """Transform sudo commands if SUDO_PASSWORD is available."""
+        """sudo変換後に、必要ならRTK経由へ書き換える。"""
         from tools.terminal_tool import _transform_sudo_command
 
-        return _transform_sudo_command(command)
-
+        transformed_command, sudo_stdin = _transform_sudo_command(command)
+        if transformed_command is None:
+            return transformed_command, sudo_stdin
+        return _rewrite_command_for_rtk(transformed_command), sudo_stdin
