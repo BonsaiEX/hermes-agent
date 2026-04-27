@@ -1841,6 +1841,16 @@ def _looks_like_slash_command(text: str) -> bool:
     return "/" not in first_word[1:]
 
 
+_CSI_CONTROL_SEQUENCE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z~]")
+
+
+def _strip_terminal_control_sequences(text: str) -> str:
+    """slash command判定前にCSI形式の端末制御シーケンスを除去する。"""
+    if not text:
+        return text
+    return _CSI_CONTROL_SEQUENCE_RE.sub("", text)
+
+
 # ============================================================================
 # Skill Slash Commands — dynamic commands generated from installed skills
 # ============================================================================
@@ -5748,6 +5758,18 @@ class HermesCLI:
             base = text.split(None, 1)[0].lower().lstrip('/')
             cmd = resolve_command(base)
             return bool(cmd and cmd.name == "model")
+        except Exception:
+            return False
+
+    def _should_handle_exit_command_inline(self, text: str, has_images: bool = False) -> bool:
+        """Return True when exit slash commands should be handled on the UI thread."""
+        if not text or has_images or not _looks_like_slash_command(text):
+            return False
+        try:
+            from hermes_cli.commands import resolve_command
+            base = text.split(None, 1)[0].lower().lstrip('/')
+            cmd = resolve_command(base)
+            return bool(cmd and cmd.name == "quit")
         except Exception:
             return False
 
@@ -10041,9 +10063,20 @@ class HermesCLI:
                 return
 
             # --- Normal input routing ---
-            text = event.app.current_buffer.text.strip()
+            raw_text = event.app.current_buffer.text
+            text = _strip_terminal_control_sequences(raw_text).strip()
             has_images = bool(self._attached_images)
             if text or has_images:
+                # Handle exit commands directly on the UI thread so they do not
+                # depend on the background process_loop draining _pending_input.
+                if self._should_handle_exit_command_inline(text, has_images=has_images):
+                    if not self.process_command(text):
+                        self._should_exit = True
+                        if event.app.is_running:
+                            event.app.exit()
+                    event.app.current_buffer.reset(append_to_history=True)
+                    return
+
                 # Handle /model directly on the UI thread so interactive pickers
                 # can safely use prompt_toolkit terminal handoff helpers.
                 if self._should_handle_model_command_inline(text, has_images=has_images):
@@ -11459,7 +11492,6 @@ class HermesCLI:
                     submit_images = []
                     if isinstance(user_input, tuple):
                         user_input, submit_images = user_input
-
                     if isinstance(user_input, str):
                         user_input = _strip_leaked_bracketed_paste_wrappers(user_input)
                         user_input, _had_mouse_reports = _strip_leaked_terminal_responses_with_meta(user_input)
