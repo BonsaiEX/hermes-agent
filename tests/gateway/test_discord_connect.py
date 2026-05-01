@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -378,6 +379,10 @@ async def test_safe_sync_slash_commands_only_mutates_diffs():
         "recreated": 0,
         "created": 1,
         "deleted": 1,
+        "failed": 0,
+        "failed_targets": [],
+        "failed_ops": [],
+        "failed_steps": [],
     }
     fake_http.edit_global_command.assert_awaited_once_with(999, 12, desired_updated)
     fake_http.upsert_global_command.assert_awaited_once_with(999, desired_created)
@@ -454,6 +459,10 @@ async def test_safe_sync_slash_commands_recreates_metadata_only_diffs():
         "recreated": 1,
         "created": 0,
         "deleted": 0,
+        "failed": 0,
+        "failed_targets": [],
+        "failed_ops": [],
+        "failed_steps": [],
     }
     fake_http.edit_global_command.assert_not_awaited()
     fake_http.delete_global_command.assert_awaited_once_with(999, 12)
@@ -471,6 +480,99 @@ async def test_post_connect_initialization_skips_sync_when_policy_off(monkeypatc
     await adapter._run_post_connect_initialization()
 
     fake_tree.sync.assert_not_called()
+
+
+def test_get_discord_slash_sync_timeout_defaults_to_30_seconds(monkeypatch):
+    monkeypatch.delenv("DISCORD_SLASH_SYNC_TIMEOUT", raising=False)
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+
+    assert adapter._get_discord_slash_sync_timeout() == 30.0
+
+
+def test_get_discord_slash_sync_timeout_prefers_config_extra(monkeypatch):
+    monkeypatch.setenv("DISCORD_SLASH_SYNC_TIMEOUT", "45")
+    adapter = DiscordAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={"slash_sync_timeout": 75},
+        )
+    )
+
+    assert adapter._get_discord_slash_sync_timeout() == 75.0
+
+
+@pytest.mark.parametrize("raw", ["", "abc", "0", "-5"])
+def test_get_discord_slash_sync_timeout_invalid_values_fallback(monkeypatch, raw):
+    monkeypatch.setenv("DISCORD_SLASH_SYNC_TIMEOUT", raw)
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+
+    assert adapter._get_discord_slash_sync_timeout() == 30.0
+
+
+def test_get_discord_slash_sync_command_timeout_defaults_to_15_seconds(monkeypatch):
+    monkeypatch.delenv("DISCORD_SLASH_SYNC_COMMAND_TIMEOUT", raising=False)
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+
+    assert adapter._get_discord_slash_sync_command_timeout() == 15.0
+
+
+def test_get_discord_slash_sync_command_timeout_prefers_config_extra(monkeypatch):
+    monkeypatch.setenv("DISCORD_SLASH_SYNC_COMMAND_TIMEOUT", "9")
+    adapter = DiscordAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={"slash_sync_command_timeout": 12},
+        )
+    )
+
+    assert adapter._get_discord_slash_sync_command_timeout() == 12.0
+
+
+@pytest.mark.parametrize("raw", ["", "abc", "0", "-5"])
+def test_get_discord_slash_sync_command_timeout_invalid_values_fallback(monkeypatch, raw):
+    monkeypatch.setenv("DISCORD_SLASH_SYNC_COMMAND_TIMEOUT", raw)
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+
+    assert adapter._get_discord_slash_sync_command_timeout() == 15.0
+
+
+@pytest.mark.asyncio
+async def test_post_connect_initialization_logs_timeout_context(monkeypatch, caplog):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+    monkeypatch.setenv("DISCORD_COMMAND_SYNC_POLICY", "safe")
+    monkeypatch.setenv("DISCORD_SLASH_SYNC_TIMEOUT", "42")
+
+    fake_tree = SimpleNamespace(
+        sync=AsyncMock(),
+        get_commands=lambda: [SimpleNamespace(name="compress"), SimpleNamespace(name="status")],
+    )
+    adapter._client = SimpleNamespace(tree=fake_tree)
+
+    async def _fake_safe_sync():
+        adapter._slash_sync_status.update(
+            {
+                "phase": "mutate",
+                "op": "update",
+                "index": 2,
+                "target": "compress",
+            }
+        )
+        raise asyncio.TimeoutError()
+
+    adapter._safe_sync_slash_commands = AsyncMock(side_effect=_fake_safe_sync)
+
+    with caplog.at_level(logging.WARNING):
+        await adapter._run_post_connect_initialization()
+
+    assert "timed out after 42.0s" in caplog.text
+    assert "policy=safe" in caplog.text
+    assert "mode=safe" in caplog.text
+    assert "commands=2" in caplog.text
+    assert "op=update" in caplog.text
+    assert "step=n/a" in caplog.text
+    assert "target=compress" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -563,6 +665,10 @@ async def test_safe_sync_reads_permission_attrs_from_existing_command():
         "recreated": 0,
         "created": 0,
         "deleted": 0,
+        "failed": 0,
+        "failed_targets": [],
+        "failed_ops": [],
+        "failed_steps": [],
     }
     fake_http.edit_global_command.assert_not_awaited()
     fake_http.delete_global_command.assert_not_awaited()
@@ -655,3 +761,171 @@ async def test_safe_sync_detects_contexts_drift():
     fake_http.edit_global_command.assert_not_awaited()
     fake_http.delete_global_command.assert_awaited_once_with(999, 77)
     fake_http.upsert_global_command.assert_awaited_once_with(999, desired)
+
+
+@pytest.mark.asyncio
+async def test_safe_sync_treats_default_contexts_and_installs_as_unchanged():
+    """Discord explicit default arrays should compare equal to local None defaults."""
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+
+    class _DesiredCommand:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def to_dict(self, tree):
+            return dict(self._payload)
+
+    class _ExistingCommand:
+        def __init__(self, command_id, payload):
+            self.id = command_id
+            self.name = payload["name"]
+            self.description = payload["description"]
+            self.type = SimpleNamespace(value=1)
+            self.nsfw = payload.get("nsfw", False)
+            self.guild_only = not payload.get("dm_permission", True)
+            self.default_member_permissions = None
+            self._payload = payload
+
+        def to_dict(self):
+            return {
+                "id": self.id,
+                "type": 1,
+                "application_id": 999,
+                "name": self.name,
+                "description": self.description,
+                "name_localizations": {},
+                "description_localizations": {},
+                "options": self._payload.get("options", []),
+                "contexts": self._payload.get("contexts"),
+                "integration_types": self._payload.get("integration_types"),
+            }
+
+    desired = {
+        "name": "deny",
+        "description": "Deny a pending dangerous command",
+        "type": 1,
+        "options": [
+            {
+                "type": 3,
+                "name": "scope",
+                "description": "Optional: 'all' to deny all pending commands",
+                "required": False,
+            }
+        ],
+        "nsfw": False,
+        "dm_permission": True,
+        "default_member_permissions": None,
+        "contexts": None,
+        "integration_types": None,
+    }
+    existing = _ExistingCommand(
+        55,
+        {
+            **desired,
+            "contexts": [0, 1, 2],
+            "integration_types": [0, 1],
+        },
+    )
+
+    fake_tree = SimpleNamespace(
+        get_commands=lambda: [_DesiredCommand(desired)],
+        fetch_commands=AsyncMock(return_value=[existing]),
+    )
+    fake_http = SimpleNamespace(
+        upsert_global_command=AsyncMock(),
+        edit_global_command=AsyncMock(),
+        delete_global_command=AsyncMock(),
+    )
+    adapter._client = SimpleNamespace(
+        tree=fake_tree,
+        http=fake_http,
+        application_id=999,
+        user=SimpleNamespace(id=999),
+    )
+
+    summary = await adapter._safe_sync_slash_commands()
+
+    assert summary == {
+        "total": 1,
+        "unchanged": 1,
+        "updated": 0,
+        "recreated": 0,
+        "created": 0,
+        "deleted": 0,
+        "failed": 0,
+        "failed_targets": [],
+        "failed_ops": [],
+        "failed_steps": [],
+    }
+    fake_http.edit_global_command.assert_not_awaited()
+    fake_http.delete_global_command.assert_not_awaited()
+    fake_http.upsert_global_command.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_safe_sync_continues_after_per_command_upsert_timeout(monkeypatch):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+    monkeypatch.setenv("DISCORD_SLASH_SYNC_COMMAND_TIMEOUT", "0.01")
+
+    class _DesiredCommand:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def to_dict(self, tree):
+            return dict(self._payload)
+
+    desired_deny = {
+        "name": "deny",
+        "description": "Deny a pending dangerous command",
+        "type": 1,
+        "options": [],
+        "nsfw": False,
+        "dm_permission": True,
+        "default_member_permissions": None,
+    }
+    desired_status = {
+        "name": "status",
+        "description": "Show Hermes session status",
+        "type": 1,
+        "options": [],
+        "nsfw": False,
+        "dm_permission": True,
+        "default_member_permissions": None,
+    }
+
+    async def slow_upsert(app_id, payload):
+        if payload["name"] == "deny":
+            await asyncio.sleep(0.05)
+        return {"id": app_id, "name": payload["name"]}
+
+    fake_tree = SimpleNamespace(
+        get_commands=lambda: [_DesiredCommand(desired_deny), _DesiredCommand(desired_status)],
+        fetch_commands=AsyncMock(return_value=[]),
+    )
+    fake_http = SimpleNamespace(
+        upsert_global_command=AsyncMock(side_effect=slow_upsert),
+        edit_global_command=AsyncMock(),
+        delete_global_command=AsyncMock(),
+    )
+    adapter._client = SimpleNamespace(
+        tree=fake_tree,
+        http=fake_http,
+        application_id=999,
+        user=SimpleNamespace(id=999),
+    )
+
+    summary = await adapter._safe_sync_slash_commands()
+
+    assert summary == {
+        "total": 2,
+        "unchanged": 0,
+        "updated": 0,
+        "recreated": 0,
+        "created": 1,
+        "deleted": 0,
+        "failed": 1,
+        "failed_targets": ["deny"],
+        "failed_ops": ["create"],
+        "failed_steps": ["upsert_global_command"],
+    }
+    assert fake_http.upsert_global_command.await_count == 2

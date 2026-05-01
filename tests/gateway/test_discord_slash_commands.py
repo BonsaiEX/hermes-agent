@@ -283,6 +283,97 @@ async def test_plugin_command_name_conflict_skipped(adapter):
 
 
 # ------------------------------------------------------------------
+# _run_simple_slash — defer + direct interaction completion
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_simple_slash_edits_original_response_with_handler_result(adapter):
+    interaction = SimpleNamespace(
+        response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+        followup=SimpleNamespace(send=AsyncMock()),
+        user=SimpleNamespace(name="Jezza", display_name="Jezza", id=42),
+        channel=SimpleNamespace(id=123),
+        channel_id=123,
+        guild_id=456,
+    )
+    adapter._message_handler = AsyncMock(return_value="Compression done")
+
+    await adapter._run_simple_slash(interaction, "/compress")
+
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    adapter._message_handler.assert_awaited_once()
+    interaction.edit_original_response.assert_awaited_once_with(content="Compression done")
+    interaction.delete_original_response.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_simple_slash_deletes_original_response_when_result_empty(adapter):
+    interaction = SimpleNamespace(
+        response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+        followup=SimpleNamespace(send=AsyncMock()),
+        user=SimpleNamespace(name="Jezza", display_name="Jezza", id=42),
+        channel=SimpleNamespace(id=123),
+        channel_id=123,
+        guild_id=456,
+    )
+    adapter._message_handler = AsyncMock(return_value="")
+
+    await adapter._run_simple_slash(interaction, "/help")
+
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    interaction.delete_original_response.assert_awaited_once()
+    interaction.edit_original_response.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_simple_slash_returns_error_to_interaction_on_exception(adapter):
+    interaction = SimpleNamespace(
+        response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+        followup=SimpleNamespace(send=AsyncMock()),
+        user=SimpleNamespace(name="Jezza", display_name="Jezza", id=42),
+        channel=SimpleNamespace(id=123),
+        channel_id=123,
+        guild_id=456,
+    )
+    adapter._message_handler = AsyncMock(side_effect=RuntimeError("boom"))
+
+    await adapter._run_simple_slash(interaction, "/model")
+
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    interaction.edit_original_response.assert_awaited_once()
+    assert "エラー" in interaction.edit_original_response.await_args.kwargs["content"]
+    interaction.delete_original_response.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_simple_slash_splits_long_response_into_followups(adapter):
+    interaction = SimpleNamespace(
+        response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+        followup=SimpleNamespace(send=AsyncMock()),
+        user=SimpleNamespace(name="Jezza", display_name="Jezza", id=42),
+        channel=SimpleNamespace(id=123),
+        channel_id=123,
+        guild_id=456,
+    )
+    long_text = "x" * (adapter.MAX_MESSAGE_LENGTH + 50)
+    adapter._message_handler = AsyncMock(return_value=long_text)
+
+    await adapter._run_simple_slash(interaction, "/help")
+
+    interaction.edit_original_response.assert_awaited_once()
+    interaction.followup.send.assert_awaited()
+
+
+# ------------------------------------------------------------------
 # _handle_thread_create_slash — success, session dispatch, failure
 # ------------------------------------------------------------------
 
@@ -965,4 +1056,3 @@ def test_register_skill_command_autocomplete_filters_by_name_and_description(ada
     # (covered in other tests). The autocomplete filter itself is exercised
     # via direct function call in the real-discord integration path.
     assert skill_cmd.callback is not None
-
