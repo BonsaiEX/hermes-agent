@@ -11716,6 +11716,32 @@ class HermesCLI:
                     self.agent.interrupt()
                 except Exception:
                     pass
+            # Flush memories before exit (only for substantial conversations).
+            # タイムアウト付き daemon スレッドで実行し、exit後のターミナル固着を防ぐ。
+            # auxiliary.flush_memories.timeout は最大60sだが、exit時は短く打ち切る。
+            if self.agent and self.conversation_history:
+                try:
+                    try:
+                        _flush_timeout = max(1.0, float(os.getenv("HERMES_FLUSH_EXIT_TIMEOUT", "8")))
+                    except (ValueError, TypeError):
+                        _flush_timeout = 8.0
+                    _flush_t0 = time.monotonic()
+                    _flush_thread = threading.Thread(
+                        target=lambda: self.agent.flush_memories(self.conversation_history),
+                        daemon=True,
+                    )
+                    _flush_thread.start()
+                    _flush_thread.join(timeout=_flush_timeout)
+                    _flush_elapsed = time.monotonic() - _flush_t0
+                    if _flush_thread.is_alive():
+                        logger.warning(
+                            "flush_memories: timed out after %.1fs (limit %.1fs) — skipping",
+                            _flush_elapsed, _flush_timeout,
+                        )
+                    else:
+                        logger.info("flush_memories: completed in %.1fs", _flush_elapsed)
+                except (Exception, KeyboardInterrupt):
+                    pass
             # Shut down voice recorder (release persistent audio stream)
             if hasattr(self, '_voice_recorder') and self._voice_recorder:
                 try:
@@ -11756,7 +11782,9 @@ class HermesCLI:
                     )
                 except Exception:
                     pass
+            _cleanup_t0 = time.monotonic()
             _run_cleanup()
+            logger.info("_run_cleanup: completed in %.1fs", time.monotonic() - _cleanup_t0)
             self._print_exit_summary()
 
 

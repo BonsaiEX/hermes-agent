@@ -3338,10 +3338,11 @@ def _remove_custom_provider(config):
             clear_screen=False,
             title="Select provider to remove:",
         )
-        idx = menu.show()
-        from hermes_cli.curses_ui import flush_stdin
-
-        flush_stdin()
+        try:
+            idx = menu.show()
+        finally:
+            from hermes_cli.curses_ui import flush_stdin
+            flush_stdin()
         print()
     except (ImportError, NotImplementedError, OSError, subprocess.SubprocessError):
         for i, c in enumerate(choices, 1):
@@ -3424,10 +3425,11 @@ def _model_flow_named_custom(config, provider_info):
                 clear_screen=False,
                 title=f"Select model from {name}:",
             )
-            idx = menu.show()
-            from hermes_cli.curses_ui import flush_stdin
-
-            flush_stdin()
+            try:
+                idx = menu.show()
+            finally:
+                from hermes_cli.curses_ui import flush_stdin
+                flush_stdin()
             print()
             if idx is None or idx >= len(models):
                 print("Cancelled.")
@@ -3602,10 +3604,11 @@ def _prompt_reasoning_effort_selection(efforts, current_effort=""):
             clear_screen=False,
             title="Select reasoning effort:",
         )
-        idx = menu.show()
-        from hermes_cli.curses_ui import flush_stdin
-
-        flush_stdin()
+        try:
+            idx = menu.show()
+        finally:
+            from hermes_cli.curses_ui import flush_stdin
+            flush_stdin()
         if idx is None:
             return None
         print()
