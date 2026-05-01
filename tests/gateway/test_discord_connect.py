@@ -566,7 +566,8 @@ async def test_post_connect_initialization_logs_timeout_context(monkeypatch, cap
     with caplog.at_level(logging.WARNING):
         await adapter._run_post_connect_initialization()
 
-    assert "timed out after 42.0s" in caplog.text
+    assert "timed out after 600.0s" in caplog.text
+    assert "configured 42.0s" in caplog.text
     assert "policy=safe" in caplog.text
     assert "mode=safe" in caplog.text
     assert "commands=2" in caplog.text

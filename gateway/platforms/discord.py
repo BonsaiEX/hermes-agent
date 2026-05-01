@@ -861,12 +861,17 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
         except asyncio.TimeoutError:
             status = dict(self._slash_sync_status or {})
+            _reported_timeout = (
+                f"{safe_timeout_seconds:.1f}s (configured {timeout_seconds:.1f}s)"
+                if sync_policy == "safe" and safe_timeout_seconds != timeout_seconds
+                else f"{timeout_seconds:.1f}s"
+            )
             logger.warning(
-                "[%s] Slash command sync timed out after %.1fs "
+                "[%s] Slash command sync timed out after %s "
                 "(policy=%s mode=%s commands=%s phase=%s op=%s step=%s index=%s target=%s) "
                 "— Discord rate-limit bucket may be saturated; will retry on next reconnect",
                 self.name,
-                safe_timeout_seconds if sync_policy == "safe" else timeout_seconds,
+                _reported_timeout,
                 sync_policy,
                 "bulk" if sync_policy == "bulk" else "safe",
                 command_count,
