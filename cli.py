@@ -716,10 +716,7 @@ def _run_cleanup():
             # ``_persist_session``. Fall back to no-arg on test stubs /
             # partially-initialised agents where the attribute is missing.
             _session_msgs = getattr(_active_agent_ref, '_session_messages', None)
-            if isinstance(_session_msgs, list):
-                _active_agent_ref.shutdown_memory_provider(_session_msgs)
-            else:
-                _active_agent_ref.shutdown_memory_provider()
+            _shutdown_memory_provider_with_timeout(_active_agent_ref, _session_msgs)
     except Exception:
         pass
 
@@ -730,6 +727,56 @@ def _run_cleanup():
 
 # Tracks the active worktree for cleanup on exit
 _active_worktree: Optional[Dict[str, str]] = None
+
+
+def _shutdown_memory_provider_with_timeout(
+    agent: Any,
+    session_messages: Optional[list] = None,
+) -> None:
+    """終了時の memory provider 停止を短時間で打ち切る。"""
+    if not agent or not hasattr(agent, "shutdown_memory_provider"):
+        logger.info("shutdown_memory_provider not available on agent; skipping exit memory shutdown")
+        return
+
+    try:
+        _flush_timeout = max(1.0, float(os.getenv("HERMES_FLUSH_EXIT_TIMEOUT", "8")))
+    except (ValueError, TypeError):
+        _flush_timeout = 8.0
+
+    _shutdown_error: list[BaseException] = []
+
+    def _run_shutdown() -> None:
+        try:
+            if isinstance(session_messages, list):
+                agent.shutdown_memory_provider(session_messages)
+            else:
+                agent.shutdown_memory_provider()
+        except BaseException as exc:
+            _shutdown_error.append(exc)
+
+    _flush_t0 = time.monotonic()
+    _flush_thread = threading.Thread(target=_run_shutdown, daemon=True)
+    _flush_thread.start()
+    _flush_thread.join(timeout=_flush_timeout)
+    _flush_elapsed = time.monotonic() - _flush_t0
+
+    if _flush_thread.is_alive():
+        logger.warning(
+            "shutdown_memory_provider: timed out after %.1fs (limit %.1fs) - skipping",
+            _flush_elapsed,
+            _flush_timeout,
+        )
+        return
+
+    if _shutdown_error:
+        logger.warning(
+            "shutdown_memory_provider: failed after %.1fs: %s",
+            _flush_elapsed,
+            _shutdown_error[0],
+        )
+        return
+
+    logger.info("shutdown_memory_provider: completed in %.1fs", _flush_elapsed)
 
 
 def _git_repo_root() -> Optional[str]:
@@ -11715,32 +11762,6 @@ class HermesCLI:
                 try:
                     self.agent.interrupt()
                 except Exception:
-                    pass
-            # Flush memories before exit (only for substantial conversations).
-            # タイムアウト付き daemon スレッドで実行し、exit後のターミナル固着を防ぐ。
-            # auxiliary.flush_memories.timeout は最大60sだが、exit時は短く打ち切る。
-            if self.agent and self.conversation_history:
-                try:
-                    try:
-                        _flush_timeout = max(1.0, float(os.getenv("HERMES_FLUSH_EXIT_TIMEOUT", "8")))
-                    except (ValueError, TypeError):
-                        _flush_timeout = 8.0
-                    _flush_t0 = time.monotonic()
-                    _flush_thread = threading.Thread(
-                        target=lambda: self.agent.flush_memories(self.conversation_history),
-                        daemon=True,
-                    )
-                    _flush_thread.start()
-                    _flush_thread.join(timeout=_flush_timeout)
-                    _flush_elapsed = time.monotonic() - _flush_t0
-                    if _flush_thread.is_alive():
-                        logger.warning(
-                            "flush_memories: timed out after %.1fs (limit %.1fs) — skipping",
-                            _flush_elapsed, _flush_timeout,
-                        )
-                    else:
-                        logger.info("flush_memories: completed in %.1fs", _flush_elapsed)
-                except (Exception, KeyboardInterrupt):
                     pass
             # Shut down voice recorder (release persistent audio stream)
             if hasattr(self, '_voice_recorder') and self._voice_recorder:
