@@ -906,6 +906,16 @@ DEFAULT_CONFIG = {
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+        "byterover": {
+            "auto_query": True,
+            "auto_curate": True,
+            "curate_every_n_turns": 5,
+            "min_user_chars_for_curate": 80,
+            "pre_compression_curate": True,
+            "session_end_curate": True,
+            "session_end_min_pending_chars": 300,
+            "session_end_timeout": 30,
+        },
     },
 
     # Subagent delegation — override the provider:model used by delegate_task
