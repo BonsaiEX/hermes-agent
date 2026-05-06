@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
+from hermes_cli.config import cfg_get, load_config
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,19 @@ _CURATE_TIMEOUT = 120  # brv curate — may involve LLM processing
 # Minimum lengths to filter noise
 _MIN_QUERY_LEN = 10
 _MIN_OUTPUT_LEN = 20
+_SYNC_JOIN_TIMEOUT = 5.0
+_SHUTDOWN_JOIN_TIMEOUT = 10.0
+
+_DEFAULT_CONFIG = {
+    "auto_query": True,
+    "auto_curate": True,
+    "curate_every_n_turns": 5,
+    "min_user_chars_for_curate": 80,
+    "pre_compression_curate": True,
+    "session_end_curate": True,
+    "session_end_min_pending_chars": 300,
+    "session_end_timeout": 30,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +133,83 @@ def _get_brv_cwd() -> Path:
     return get_hermes_home() / "byterover"
 
 
+def _parse_bool_setting(value: Any, default: bool) -> bool:
+    """設定値を bool に正規化する。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    if value is None:
+        return default
+    return bool(value)
+
+
+def _parse_int_setting(value: Any, default: int, minimum: int) -> int:
+    """設定値を最小値付き整数へ正規化する。"""
+    try:
+        return max(minimum, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _load_byterover_config() -> Dict[str, Any]:
+    """memory.byterover を優先し、互換用に top-level byterover も読む。"""
+    config = dict(_DEFAULT_CONFIG)
+    try:
+        raw = load_config() or {}
+    except Exception:
+        raw = {}
+
+    candidates = [
+        raw.get("byterover", {}) or {},
+        cfg_get(raw, "memory", "byterover", default={}) or {},
+    ]
+    for section in candidates:
+        if not isinstance(section, dict):
+            continue
+        config.update({k: v for k, v in section.items() if v is not None})
+
+    config["auto_query"] = _parse_bool_setting(
+        config.get("auto_query"), _DEFAULT_CONFIG["auto_query"]
+    )
+    config["auto_curate"] = _parse_bool_setting(
+        config.get("auto_curate"), _DEFAULT_CONFIG["auto_curate"]
+    )
+    config["pre_compression_curate"] = _parse_bool_setting(
+        config.get("pre_compression_curate"),
+        _DEFAULT_CONFIG["pre_compression_curate"],
+    )
+    config["session_end_curate"] = _parse_bool_setting(
+        config.get("session_end_curate"),
+        _DEFAULT_CONFIG["session_end_curate"],
+    )
+    config["curate_every_n_turns"] = _parse_int_setting(
+        config.get("curate_every_n_turns"),
+        _DEFAULT_CONFIG["curate_every_n_turns"],
+        1,
+    )
+    config["min_user_chars_for_curate"] = _parse_int_setting(
+        config.get("min_user_chars_for_curate"),
+        _DEFAULT_CONFIG["min_user_chars_for_curate"],
+        0,
+    )
+    config["session_end_min_pending_chars"] = _parse_int_setting(
+        config.get("session_end_min_pending_chars"),
+        _DEFAULT_CONFIG["session_end_min_pending_chars"],
+        0,
+    )
+    config["session_end_timeout"] = _parse_int_setting(
+        config.get("session_end_timeout"),
+        _DEFAULT_CONFIG["session_end_timeout"],
+        1,
+    )
+    return config
+
+
 # ---------------------------------------------------------------------------
 # Tool schemas
 # ---------------------------------------------------------------------------
@@ -175,7 +266,12 @@ class ByteRoverMemoryProvider(MemoryProvider):
         self._cwd = ""
         self._session_id = ""
         self._turn_count = 0
+        self._config: Dict[str, Any] = dict(_DEFAULT_CONFIG)
         self._sync_thread: Optional[threading.Thread] = None
+        self._session_end_thread: Optional[threading.Thread] = None
+        self._pending_turns: List[str] = []
+        self._pending_chars = 0
+        self._state_lock = threading.Lock()
 
     @property
     def name(self) -> str:
@@ -200,6 +296,9 @@ class ByteRoverMemoryProvider(MemoryProvider):
         self._cwd = str(_get_brv_cwd())
         self._session_id = session_id
         self._turn_count = 0
+        self._config = _load_byterover_config()
+        self._pending_turns = []
+        self._pending_chars = 0
         Path(self._cwd).mkdir(parents=True, exist_ok=True)
 
     def system_prompt_block(self) -> str:
@@ -218,6 +317,8 @@ class ByteRoverMemoryProvider(MemoryProvider):
         Blocks until the query completes (up to _QUERY_TIMEOUT seconds), ensuring
         the result is available as context before the model is called.
         """
+        if not self._config.get("auto_query", True):
+            return ""
         if not query or len(query.strip()) < _MIN_QUERY_LEN:
             return ""
         result = _run_brv(
@@ -235,31 +336,88 @@ class ByteRoverMemoryProvider(MemoryProvider):
         pass
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        """Curate the conversation turn in background (non-blocking)."""
+        """完了ターンを pending に積み、条件を満たす時だけ background curate する。"""
         self._turn_count += 1
 
-        # Only curate substantive turns
         if len(user_content.strip()) < _MIN_QUERY_LEN:
             return
 
-        def _sync():
-            try:
-                combined = f"User: {user_content[:2000]}\nAssistant: {assistant_content[:2000]}"
-                _run_brv(
-                    ["curate", "--", combined],
-                    timeout=_CURATE_TIMEOUT, cwd=self._cwd,
-                )
-            except Exception as e:
-                logger.debug("ByteRover sync failed: %s", e)
-
-        # Wait for previous sync
-        if self._sync_thread and self._sync_thread.is_alive():
-            self._sync_thread.join(timeout=5.0)
-
-        self._sync_thread = threading.Thread(
-            target=_sync, daemon=True, name="brv-sync"
+        turn_payload = (
+            f"User: {user_content[:2000]}\nAssistant: {assistant_content[:2000]}"
         )
-        self._sync_thread.start()
+        with self._state_lock:
+            self._pending_turns.append(turn_payload)
+            self._pending_chars += len(turn_payload)
+
+        if not self._config.get("auto_curate", True):
+            return
+        if len(user_content.strip()) < self._config["min_user_chars_for_curate"]:
+            return
+        if self._turn_count % self._config["curate_every_n_turns"] != 0:
+            return
+
+        self._spawn_pending_curate(
+            reason="turn",
+            timeout=_CURATE_TIMEOUT,
+            thread_name="brv-sync",
+        )
+
+    def _spawn_pending_curate(self, *, reason: str, timeout: int, thread_name: str) -> bool:
+        """pending snapshot を安全に flush する worker を起動する。"""
+        target_attr = "_sync_thread" if reason == "turn" else "_session_end_thread"
+        existing = getattr(self, target_attr, None)
+        if existing and existing.is_alive():
+            existing.join(timeout=_SYNC_JOIN_TIMEOUT)
+        if existing and existing.is_alive():
+            logger.debug("ByteRover %s curate skipped: previous worker still running", reason)
+            return False
+
+        snapshot = self._snapshot_pending()
+        if not snapshot:
+            return False
+
+        def _sync() -> None:
+            result = _run_brv(
+                ["curate", "--", snapshot],
+                timeout=timeout,
+                cwd=self._cwd,
+            )
+            if result["success"]:
+                self._drop_pending_snapshot(snapshot)
+                logger.info(
+                    "ByteRover %s curate flushed: chars=%d",
+                    reason,
+                    len(snapshot),
+                )
+                return
+            logger.debug(
+                "ByteRover %s curate failed: %s",
+                reason,
+                result.get("error", "unknown error"),
+            )
+
+        thread = threading.Thread(target=_sync, daemon=True, name=thread_name)
+        setattr(self, target_attr, thread)
+        thread.start()
+        return True
+
+    def _snapshot_pending(self) -> str:
+        """現在の pending 全体を一貫した snapshot として取り出す。"""
+        with self._state_lock:
+            if not self._pending_turns:
+                return ""
+            return "\n\n".join(self._pending_turns)
+
+    def _drop_pending_snapshot(self, snapshot: str) -> None:
+        """成功した snapshot 分だけ pending 先頭から取り除く。"""
+        if not snapshot:
+            return
+        snapshot_parts = snapshot.split("\n\n")
+        with self._state_lock:
+            if self._pending_turns[:len(snapshot_parts)] != snapshot_parts:
+                return
+            del self._pending_turns[:len(snapshot_parts)]
+            self._pending_chars = sum(len(item) for item in self._pending_turns)
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
         """Mirror built-in memory writes to ByteRover."""
@@ -281,6 +439,8 @@ class ByteRoverMemoryProvider(MemoryProvider):
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         """Extract insights before context compression discards turns."""
+        if not self._config.get("pre_compression_curate", True):
+            return ""
         if not messages:
             return ""
 
@@ -311,6 +471,20 @@ class ByteRoverMemoryProvider(MemoryProvider):
         t.start()
         return ""
 
+    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        """終了直前に十分な pending がある時だけ background curate する。"""
+        if not self._config.get("session_end_curate", True):
+            return
+        with self._state_lock:
+            pending_chars = self._pending_chars
+        if pending_chars < self._config["session_end_min_pending_chars"]:
+            return
+        self._spawn_pending_curate(
+            reason="session_end",
+            timeout=self._config["session_end_timeout"],
+            thread_name="brv-session-end",
+        )
+
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [QUERY_SCHEMA, CURATE_SCHEMA, STATUS_SCHEMA]
 
@@ -325,7 +499,14 @@ class ByteRoverMemoryProvider(MemoryProvider):
 
     def shutdown(self) -> None:
         if self._sync_thread and self._sync_thread.is_alive():
-            self._sync_thread.join(timeout=10.0)
+            self._sync_thread.join(timeout=_SHUTDOWN_JOIN_TIMEOUT)
+        if self._session_end_thread and self._session_end_thread.is_alive():
+            self._session_end_thread.join(
+                timeout=min(
+                    _SHUTDOWN_JOIN_TIMEOUT,
+                    float(self._config.get("session_end_timeout", _CURATE_TIMEOUT)),
+                )
+            )
 
     # -- Tool implementations ------------------------------------------------
 
