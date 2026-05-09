@@ -3038,6 +3038,68 @@ def test_legacy_migration_both_columns_already_present(tmp_path):
     conn.close()
 
 
+def test_legacy_migration_ignores_duplicate_column_race(tmp_path):
+    """並行 migration で duplicate column が返っても、列が存在すれば成功扱いにする。"""
+    import sqlite3
+
+    db_path = tmp_path / "race.db"
+    raw_conn = sqlite3.connect(str(db_path))
+    raw_conn.row_factory = sqlite3.Row
+    raw_conn.execute("""
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+    """)
+    raw_conn.execute("""
+        CREATE TABLE task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            payload TEXT,
+            created_at INTEGER NOT NULL
+        )
+    """)
+    raw_conn.commit()
+
+    class ProxyConn:
+        def __init__(self, conn):
+            self._conn = conn
+            self._raised = False
+
+        def execute(self, sql, *args):
+            normalized = " ".join(sql.split()).lower()
+            if (
+                not self._raised
+                and normalized.startswith(
+                    "alter table tasks add column consecutive_failures"
+                )
+            ):
+                self._conn.execute(
+                    "ALTER TABLE tasks ADD COLUMN consecutive_failures "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+                self._conn.commit()
+                self._raised = True
+                raise sqlite3.OperationalError(
+                    "duplicate column name: consecutive_failures"
+                )
+            return self._conn.execute(sql, *args)
+
+    conn = ProxyConn(raw_conn)
+
+    kb._migrate_add_optional_columns(conn)
+
+    cols = {r[1] for r in raw_conn.execute("PRAGMA table_info(tasks)")}
+    assert "consecutive_failures" in cols
+    assert "skills" in cols
+    # 2 回目も no-op で落ちないこと。
+    kb._migrate_add_optional_columns(raw_conn)
+    raw_conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Gateway-embedded dispatcher: config, CLI warnings, daemon deprecation stub
 # ---------------------------------------------------------------------------
