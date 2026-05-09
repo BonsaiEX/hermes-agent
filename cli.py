@@ -730,12 +730,59 @@ def _run_cleanup():
             # ``_persist_session``. Fall back to no-arg on test stubs /
             # partially-initialised agents where the attribute is missing.
             _session_msgs = getattr(_active_agent_ref, '_session_messages', None)
-            if isinstance(_session_msgs, list):
-                _active_agent_ref.shutdown_memory_provider(_session_msgs)
-            else:
-                _active_agent_ref.shutdown_memory_provider()
+            _shutdown_memory_provider_with_timeout(_active_agent_ref, _session_msgs)
     except Exception:
         pass
+
+
+def _shutdown_memory_provider_with_timeout(
+    agent: Any,
+    session_messages: Optional[list] = None,
+) -> None:
+    """終了時の memory provider 停止を短時間で打ち切る。"""
+    if not agent or not hasattr(agent, "shutdown_memory_provider"):
+        logger.info("shutdown_memory_provider not available on agent; skipping exit memory shutdown")
+        return
+
+    try:
+        _flush_timeout = max(1.0, float(os.getenv("HERMES_FLUSH_EXIT_TIMEOUT", "8")))
+    except (ValueError, TypeError):
+        _flush_timeout = 8.0
+
+    _shutdown_error: list[BaseException] = []
+
+    def _run_shutdown() -> None:
+        try:
+            if isinstance(session_messages, list):
+                agent.shutdown_memory_provider(session_messages)
+            else:
+                agent.shutdown_memory_provider()
+        except BaseException as exc:
+            _shutdown_error.append(exc)
+
+    _flush_t0 = time.monotonic()
+    _flush_thread = threading.Thread(target=_run_shutdown, daemon=True)
+    _flush_thread.start()
+    _flush_thread.join(timeout=_flush_timeout)
+    _flush_elapsed = time.monotonic() - _flush_t0
+
+    if _flush_thread.is_alive():
+        logger.warning(
+            "shutdown_memory_provider: timed out after %.1fs (limit %.1fs) - skipping",
+            _flush_elapsed,
+            _flush_timeout,
+        )
+        return
+
+    if _shutdown_error:
+        logger.warning(
+            "shutdown_memory_provider: failed after %.1fs: %s",
+            _flush_elapsed,
+            _shutdown_error[0],
+        )
+        return
+
+    logger.info("shutdown_memory_provider: completed in %.1fs", _flush_elapsed)
 
 
 # =============================================================================
@@ -2095,10 +2142,21 @@ def _looks_like_slash_command(text: str) -> bool:
     """
     if not text or not text.startswith("/"):
         return False
+
     first_word = text.split()[0]
     # After stripping the leading /, a command name has no slashes.
     # A path like /Users/foo/bar.md always does.
     return "/" not in first_word[1:]
+
+
+_CSI_CONTROL_SEQUENCE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z~]")
+
+
+def _strip_terminal_control_sequences(text: str) -> str:
+    """slash command判定前にCSI形式の端末制御シーケンスを除去する。"""
+    if not text:
+        return text
+    return _CSI_CONTROL_SEQUENCE_RE.sub("", text)
 
 
 # ============================================================================
@@ -6219,6 +6277,18 @@ class HermesCLI:
             base = text.split(None, 1)[0].lower().lstrip('/')
             cmd = resolve_command(base)
             return bool(cmd and cmd.name == "model")
+        except Exception:
+            return False
+
+    def _should_handle_exit_command_inline(self, text: str, has_images: bool = False) -> bool:
+        """Return True when exit slash commands should be handled on the UI thread."""
+        if not text or has_images or not _looks_like_slash_command(text):
+            return False
+        try:
+            from hermes_cli.commands import resolve_command
+            base = text.split(None, 1)[0].lower().lstrip('/')
+            cmd = resolve_command(base)
+            return bool(cmd and cmd.name == "quit")
         except Exception:
             return False
 
@@ -10659,9 +10729,20 @@ class HermesCLI:
                 return
 
             # --- Normal input routing ---
-            text = event.app.current_buffer.text.strip()
+            raw_text = event.app.current_buffer.text
+            text = _strip_terminal_control_sequences(raw_text).strip()
             has_images = bool(self._attached_images)
             if text or has_images:
+                # Handle exit commands directly on the UI thread so they do not
+                # depend on the background process_loop draining _pending_input.
+                if self._should_handle_exit_command_inline(text, has_images=has_images):
+                    if not self.process_command(text):
+                        self._should_exit = True
+                        if event.app.is_running:
+                            event.app.exit()
+                    event.app.current_buffer.reset(append_to_history=True)
+                    return
+
                 # Handle /model directly on the UI thread so interactive pickers
                 # can safely use prompt_toolkit terminal handoff helpers.
                 if self._should_handle_model_command_inline(text, has_images=has_images):
@@ -12424,7 +12505,9 @@ class HermesCLI:
                 "This can happen with certain Python installations (e.g. uv-managed cPython on macOS).\n"
                 "Try reinstalling Python via pyenv or Homebrew, then re-run: hermes setup"
             )
+            _cleanup_t0 = time.monotonic()
             _run_cleanup()
+            logger.info("_run_cleanup: completed in %.1fs", time.monotonic() - _cleanup_t0)
             self._print_exit_summary()
             return
 
