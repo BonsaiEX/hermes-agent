@@ -5,6 +5,8 @@
 __pycache__/
 .venv/
 .vscode/
+.claude/
+.codex/
 .env
 .env.local
 .env.development.local
