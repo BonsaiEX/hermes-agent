@@ -30,6 +30,10 @@ _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
+_DEFAULT_DISCORD_SLASH_SYNC_TIMEOUT = 30.0
+_DEFAULT_DISCORD_SLASH_SYNC_COMMAND_TIMEOUT = 15.0
+_DEFAULT_DISCORD_CONTEXTS = (0, 1, 2)
+_DEFAULT_DISCORD_INTEGRATION_TYPES = (0, 1)
 
 try:
     import discord
@@ -558,6 +562,8 @@ class DiscordAdapter(BasePlatformAdapter):
         self._typing_tasks: Dict[str, asyncio.Task] = {}
         self._bot_task: Optional[asyncio.Task] = None
         self._post_connect_task: Optional[asyncio.Task] = None
+        # timeout 時に直近の sync 段階を残して原因を追えるようにする。
+        self._slash_sync_status: Dict[str, Any] = {}
         # Dedup cache: prevents duplicate bot responses when Discord
         # RESUME replays events after reconnects.
         self._dedup = MessageDeduplicator()
@@ -1037,12 +1043,22 @@ class DiscordAdapter(BasePlatformAdapter):
             return
         try:
             sync_policy = self._get_discord_command_sync_policy()
+            timeout_seconds = self._get_discord_slash_sync_timeout()
+            safe_timeout_seconds = max(timeout_seconds, 600.0)
+            command_count = self._count_registered_slash_commands()
+            self._slash_sync_status = {
+                "policy": sync_policy,
+                "timeout_seconds": timeout_seconds,
+                "command_count": command_count,
+                "phase": "init",
+            }
             if sync_policy == "off":
                 logger.info("[%s] Skipping Discord slash command sync (policy=off)", self.name)
                 return
 
             if sync_policy == "bulk":
-                synced = await asyncio.wait_for(self._client.tree.sync(), timeout=30)
+                self._slash_sync_status["phase"] = "bulk_sync"
+                synced = await asyncio.wait_for(self._client.tree.sync(), timeout=timeout_seconds)
                 logger.info("[%s] Synced %d slash command(s) via bulk tree sync", self.name, len(synced))
                 return
 
@@ -1061,11 +1077,15 @@ class DiscordAdapter(BasePlatformAdapter):
                 http.max_ratelimit_timeout = _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS
 
             try:
+                self._slash_sync_status["phase"] = "safe_sync"
                 # Discord's per-app command-management bucket is small, and
                 # discord.py can otherwise sit inside one long retry sleep
                 # before surfacing the 429. Keep the whole sync bounded and
                 # persist Discord's retry-after when it refuses the batch.
-                summary = await asyncio.wait_for(self._safe_sync_slash_commands(), timeout=600)
+                summary = await asyncio.wait_for(
+                    self._safe_sync_slash_commands(),
+                    timeout=safe_timeout_seconds,
+                )
             except Exception as e:
                 if not self._is_discord_rate_limit(e):
                     raise
@@ -1087,7 +1107,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             self._record_command_sync_success(app_id, fingerprint, summary)
             logger.info(
-                "[%s] Safely reconciled %d slash command(s): unchanged=%d updated=%d recreated=%d created=%d deleted=%d",
+                "[%s] Safely reconciled %d slash command(s): unchanged=%d updated=%d recreated=%d created=%d deleted=%d failed=%d",
                 self.name,
                 summary["total"],
                 summary["unchanged"],
@@ -1095,12 +1115,32 @@ class DiscordAdapter(BasePlatformAdapter):
                 summary["recreated"],
                 summary["created"],
                 summary["deleted"],
+                summary["failed"],
             )
+            if summary["failed"]:
+                logger.warning(
+                    "[%s] Discord safe slash sync failures: failed_targets=%s failed_ops=%s failed_steps=%s",
+                    self.name,
+                    ",".join(summary["failed_targets"]),
+                    ",".join(summary["failed_ops"]),
+                    ",".join(summary["failed_steps"]),
+                )
         except asyncio.TimeoutError:
+            status = dict(self._slash_sync_status or {})
             logger.warning(
-                "[%s] Slash command sync timed out — Discord rate-limit bucket "
-                "may be saturated; will retry on next reconnect",
+                "[%s] Slash command sync timed out after %.1fs "
+                "(policy=%s mode=%s commands=%s phase=%s op=%s step=%s index=%s target=%s) "
+                "— Discord rate-limit bucket may be saturated; will retry on next reconnect",
                 self.name,
+                safe_timeout_seconds if sync_policy == "safe" else timeout_seconds,
+                sync_policy,
+                "bulk" if sync_policy == "bulk" else "safe",
+                command_count,
+                status.get("phase", "unknown"),
+                status.get("op", "n/a"),
+                status.get("step", "n/a"),
+                status.get("index", "n/a"),
+                status.get("target", "n/a"),
             )
         except asyncio.CancelledError:
             raise
@@ -1119,10 +1159,65 @@ class DiscordAdapter(BasePlatformAdapter):
             )
         return "safe"
 
+    def _get_discord_slash_sync_timeout(self) -> float:
+        """Resolve slash sync timeout from config/env with safe fallback."""
+        raw = self.config.extra.get("slash_sync_timeout")
+        source = "config"
+        if raw in (None, ""):
+            raw = os.getenv("DISCORD_SLASH_SYNC_TIMEOUT", "")
+            source = "env"
+        if raw in (None, ""):
+            return _DEFAULT_DISCORD_SLASH_SYNC_TIMEOUT
+        try:
+            timeout = float(raw)
+            if timeout <= 0:
+                raise ValueError("timeout must be positive")
+            return timeout
+        except (TypeError, ValueError):
+            logger.warning(
+                "[%s] Invalid Discord slash sync timeout from %s: %r; falling back to %.1fs",
+                self.name,
+                source,
+                raw,
+                _DEFAULT_DISCORD_SLASH_SYNC_TIMEOUT,
+            )
+            return _DEFAULT_DISCORD_SLASH_SYNC_TIMEOUT
+
+    def _get_discord_slash_sync_command_timeout(self) -> float:
+        """Resolve per-command slash sync timeout from config/env with safe fallback."""
+        raw = self.config.extra.get("slash_sync_command_timeout")
+        source = "config"
+        if raw in (None, ""):
+            raw = os.getenv("DISCORD_SLASH_SYNC_COMMAND_TIMEOUT", "")
+            source = "env"
+        if raw in (None, ""):
+            return _DEFAULT_DISCORD_SLASH_SYNC_COMMAND_TIMEOUT
+        try:
+            timeout = float(raw)
+            if timeout <= 0:
+                raise ValueError("timeout must be positive")
+            return timeout
+        except (TypeError, ValueError):
+            logger.warning(
+                "[%s] Invalid Discord slash sync command timeout from %s: %r; falling back to %.1fs",
+                self.name,
+                source,
+                raw,
+                _DEFAULT_DISCORD_SLASH_SYNC_COMMAND_TIMEOUT,
+            )
+            return _DEFAULT_DISCORD_SLASH_SYNC_COMMAND_TIMEOUT
+
+    def _count_registered_slash_commands(self) -> int:
+        """Return the number of currently registered command candidates."""
+        if not self._client:
+            return 0
+        try:
+            return len(self._client.tree.get_commands())
+        except Exception:
+            return 0
+
     def _canonicalize_app_command_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Reduce command payloads to the semantic fields Hermes manages."""
-        contexts = payload.get("contexts")
-        integration_types = payload.get("integration_types")
         return {
             "type": int(payload.get("type", 1) or 1),
             "name": str(payload.get("name", "") or ""),
@@ -1132,9 +1227,9 @@ class DiscordAdapter(BasePlatformAdapter):
             ),
             "dm_permission": bool(payload.get("dm_permission", True)),
             "nsfw": bool(payload.get("nsfw", False)),
-            "contexts": sorted(int(c) for c in contexts) if contexts else None,
-            "integration_types": (
-                sorted(int(i) for i in integration_types) if integration_types else None
+            "contexts": self._normalize_contexts(payload.get("contexts")),
+            "integration_types": self._normalize_integration_types(
+                payload.get("integration_types")
             ),
             "options": [
                 self._canonicalize_app_command_option(item)
@@ -1142,6 +1237,26 @@ class DiscordAdapter(BasePlatformAdapter):
                 if isinstance(item, dict)
             ],
         }
+
+    @staticmethod
+    def _normalize_contexts(value: Any) -> Optional[list[int]]:
+        """Treat Discord's explicit default contexts as semantically equal to None."""
+        if not value:
+            return None
+        normalized = sorted(int(item) for item in value)
+        if tuple(normalized) == _DEFAULT_DISCORD_CONTEXTS:
+            return None
+        return normalized
+
+    @staticmethod
+    def _normalize_integration_types(value: Any) -> Optional[list[int]]:
+        """Treat Discord's explicit default integration types as semantically equal to None."""
+        if not value:
+            return None
+        normalized = sorted(int(item) for item in value)
+        if tuple(normalized) == _DEFAULT_DISCORD_INTEGRATION_TYPES:
+            return None
+        return normalized
 
     @staticmethod
     def _normalize_permissions(value: Any) -> Optional[str]:
@@ -1210,7 +1325,56 @@ class DiscordAdapter(BasePlatformAdapter):
             "options": canonical["options"],
         }
 
-    async def _safe_sync_slash_commands(self) -> Dict[str, int]:
+    async def _run_slash_sync_http_op(
+        self,
+        awaitable,
+        *,
+        command_timeout: float,
+        target_name: str,
+        op_name: str,
+        step_name: str,
+        phase: str,
+        index: int,
+    ) -> bool:
+        """Run one slash sync HTTP mutation with per-command timeout."""
+        self._slash_sync_status.update(
+            {
+                "phase": phase,
+                "op": op_name,
+                "step": step_name,
+                "target": target_name,
+                "index": index,
+            }
+        )
+        try:
+            await asyncio.wait_for(awaitable, timeout=command_timeout)
+            return True
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[%s] Discord slash sync command timed out after %.1fs "
+                "(target=%s op=%s step=%s index=%d)",
+                self.name,
+                command_timeout,
+                target_name,
+                op_name,
+                step_name,
+                index,
+            )
+            return False
+        except Exception as exc:
+            logger.warning(
+                "[%s] Discord slash sync command failed "
+                "(target=%s op=%s step=%s index=%d): %s",
+                self.name,
+                target_name,
+                op_name,
+                step_name,
+                index,
+                exc,
+            )
+            return False
+
+    async def _safe_sync_slash_commands(self) -> Dict[str, Any]:
         """Diff existing global commands and only mutate the commands that changed."""
         if not self._client:
             return {
@@ -1220,6 +1384,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 "recreated": 0,
                 "created": 0,
                 "deleted": 0,
+                "failed": 0,
+                "failed_targets": [],
+                "failed_ops": [],
+                "failed_steps": [],
             }
 
         tree = self._client.tree
@@ -1228,6 +1396,17 @@ class DiscordAdapter(BasePlatformAdapter):
             raise RuntimeError("Discord application ID is unavailable for slash command sync")
 
         desired_payloads = [command.to_dict(tree) for command in tree.get_commands()]
+        command_timeout = self._get_discord_slash_sync_command_timeout()
+        self._slash_sync_status.update(
+            {
+                "phase": "fetch_existing",
+                "op": "fetch_commands",
+                "step": "fetch_commands",
+                "target": "global",
+                "index": 0,
+                "total": len(desired_payloads),
+            }
+        )
         desired_by_key = {
             (int(payload.get("type", 1) or 1), str(payload.get("name", "") or "").lower()): payload
             for payload in desired_payloads
@@ -1246,22 +1425,48 @@ class DiscordAdapter(BasePlatformAdapter):
         recreated = 0
         created = 0
         deleted = 0
+        failed = 0
+        failed_targets: list[str] = []
+        failed_ops: list[str] = []
+        failed_steps: list[str] = []
         http = self._client.http
         mutation_count = 0
 
-        async def mutate(call, *args):
+        async def mutate(awaitable, *, target_name: str, op_name: str, step_name: str, phase: str, index: int):
             nonlocal mutation_count
             if mutation_count:
                 await self._sleep_between_command_sync_mutations()
-            result = await call(*args)
+            ok = await self._run_slash_sync_http_op(
+                awaitable,
+                command_timeout=command_timeout,
+                target_name=target_name,
+                op_name=op_name,
+                step_name=step_name,
+                phase=phase,
+                index=index,
+            )
             mutation_count += 1
-            return result
+            return ok
 
-        for key, desired in desired_by_key.items():
+        for idx, (key, desired) in enumerate(desired_by_key.items(), start=1):
+            target_name = str(desired.get("name", "") or key[1] or "")
             current = existing_by_key.pop(key, None)
             if current is None:
-                await mutate(http.upsert_global_command, app_id, desired)
-                created += 1
+                ok = await mutate(
+                    http.upsert_global_command(app_id, desired),
+                    target_name=target_name,
+                    op_name="create",
+                    step_name="upsert_global_command",
+                    phase="mutate",
+                    index=idx,
+                )
+                if ok:
+                    created += 1
+                else:
+                    failed += 1
+                    failed_targets.append(target_name)
+                    failed_ops.append("create")
+                    failed_steps.append("upsert_global_command")
                 continue
 
             current_existing_payload = self._existing_command_to_payload(current)
@@ -1272,17 +1477,70 @@ class DiscordAdapter(BasePlatformAdapter):
                 continue
 
             if self._patchable_app_command_payload(current_existing_payload) == self._patchable_app_command_payload(desired):
-                await mutate(http.delete_global_command, app_id, current.id)
-                await mutate(http.upsert_global_command, app_id, desired)
-                recreated += 1
+                delete_ok = await mutate(
+                    http.delete_global_command(app_id, current.id),
+                    target_name=target_name,
+                    op_name="recreate",
+                    step_name="delete_global_command",
+                    phase="mutate",
+                    index=idx,
+                )
+                if not delete_ok:
+                    failed += 1
+                    failed_targets.append(target_name)
+                    failed_ops.append("recreate")
+                    failed_steps.append("delete_global_command")
+                    continue
+                create_ok = await mutate(
+                    http.upsert_global_command(app_id, desired),
+                    target_name=target_name,
+                    op_name="recreate",
+                    step_name="upsert_global_command",
+                    phase="mutate",
+                    index=idx,
+                )
+                if create_ok:
+                    recreated += 1
+                else:
+                    failed += 1
+                    failed_targets.append(target_name)
+                    failed_ops.append("recreate")
+                    failed_steps.append("upsert_global_command")
                 continue
 
-            await mutate(http.edit_global_command, app_id, current.id, desired)
-            updated += 1
+            ok = await mutate(
+                http.edit_global_command(app_id, current.id, desired),
+                target_name=target_name,
+                op_name="update",
+                step_name="edit_global_command",
+                phase="mutate",
+                index=idx,
+            )
+            if ok:
+                updated += 1
+            else:
+                failed += 1
+                failed_targets.append(target_name)
+                failed_ops.append("update")
+                failed_steps.append("edit_global_command")
 
-        for current in existing_by_key.values():
-            await mutate(http.delete_global_command, app_id, current.id)
-            deleted += 1
+        for delete_idx, current in enumerate(existing_by_key.values(), start=1):
+            delete_target = str(getattr(current, "name", "") or "")
+            ok = await mutate(
+                http.delete_global_command(app_id, current.id),
+                target_name=delete_target,
+                op_name="delete",
+                step_name="delete_global_command",
+                phase="cleanup",
+                index=delete_idx,
+            )
+            if ok:
+                deleted += 1
+            else:
+                failed += 1
+                failed_targets.append(delete_target)
+                failed_ops.append("delete")
+                failed_steps.append("delete_global_command")
 
         return {
             "total": len(desired_payloads),
@@ -1291,6 +1549,10 @@ class DiscordAdapter(BasePlatformAdapter):
             "recreated": recreated,
             "created": created,
             "deleted": deleted,
+            "failed": failed,
+            "failed_targets": failed_targets,
+            "failed_ops": failed_ops,
+            "failed_steps": failed_steps,
         }
 
     async def _add_reaction(self, message: Any, emoji: str) -> bool:
@@ -2858,14 +3120,55 @@ class DiscordAdapter(BasePlatformAdapter):
         if not await self._check_slash_authorization(interaction, command_text):
             return
 
-        await interaction.response.defer(ephemeral=True)
+        try:
+            logger.debug(
+                "[Discord] slash interaction defer starting cmd=%s guild=%s channel=%s user=%s",
+                command_text,
+                getattr(interaction, "guild_id", None),
+                getattr(interaction, "channel_id", None),
+                getattr(getattr(interaction, "user", None), "id", None),
+            )
+            await interaction.response.defer(ephemeral=True)
+            logger.debug("[Discord] slash interaction defer succeeded cmd=%s", command_text)
+        except Exception:
+            logger.exception("[Discord] slash interaction defer failed cmd=%s", command_text)
+            raise
+
         event = self._build_slash_event(interaction, command_text)
-        await self.handle_message(event)
+        try:
+            logger.debug("[Discord] slash interaction dispatch starting cmd=%s", command_text)
+            response_text = None
+            if self._message_handler is not None:
+                response_text = await self._message_handler(event)
+            else:
+                await self.handle_message(event)
+            logger.debug(
+                "[Discord] slash interaction dispatch finished cmd=%s has_response=%s",
+                command_text,
+                bool(response_text),
+            )
+        except Exception:
+            logger.exception("[Discord] slash interaction dispatch failed cmd=%s", command_text)
+            try:
+                await interaction.edit_original_response(
+                    content="処理中にエラーが発生しました。ログを確認してください。"
+                )
+            except Exception:
+                logger.exception("[Discord] slash interaction error response failed cmd=%s", command_text)
+            return
+
         try:
             if followup_msg:
                 await interaction.edit_original_response(content=followup_msg)
-            else:
-                await interaction.delete_original_response()
+                return
+            if response_text:
+                formatted = self.format_message(str(response_text))
+                chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+                await interaction.edit_original_response(content=chunks[0])
+                for chunk in chunks[1:]:
+                    await interaction.followup.send(chunk, ephemeral=True)
+                return
+            await interaction.delete_original_response()
         except Exception as e:
             logger.debug("Discord interaction cleanup failed: %s", e)
 

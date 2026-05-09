@@ -451,6 +451,10 @@ async def test_safe_sync_slash_commands_only_mutates_diffs():
         "recreated": 0,
         "created": 1,
         "deleted": 1,
+        "failed": 0,
+        "failed_targets": [],
+        "failed_ops": [],
+        "failed_steps": [],
     }
     fake_http.edit_global_command.assert_awaited_once_with(999, 12, desired_updated)
     fake_http.upsert_global_command.assert_awaited_once_with(999, desired_created)
@@ -527,6 +531,10 @@ async def test_safe_sync_slash_commands_recreates_metadata_only_diffs():
         "recreated": 1,
         "created": 0,
         "deleted": 0,
+        "failed": 0,
+        "failed_targets": [],
+        "failed_ops": [],
+        "failed_steps": [],
     }
     fake_http.edit_global_command.assert_not_awaited()
     fake_http.delete_global_command.assert_awaited_once_with(999, 12)
@@ -813,6 +821,10 @@ async def test_safe_sync_reads_permission_attrs_from_existing_command():
         "recreated": 0,
         "created": 0,
         "deleted": 0,
+        "failed": 0,
+        "failed_targets": [],
+        "failed_ops": [],
+        "failed_steps": [],
     }
     fake_http.edit_global_command.assert_not_awaited()
     fake_http.delete_global_command.assert_not_awaited()
@@ -905,3 +917,68 @@ async def test_safe_sync_detects_contexts_drift():
     fake_http.edit_global_command.assert_not_awaited()
     fake_http.delete_global_command.assert_awaited_once_with(999, 77)
     fake_http.upsert_global_command.assert_awaited_once_with(999, desired)
+
+
+def test_canonicalize_app_command_payload_normalizes_default_contexts():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+
+    payload = adapter._canonicalize_app_command_payload(
+        {
+            "name": "help",
+            "description": "Show commands",
+            "type": 1,
+            "options": [],
+            "contexts": [2, 0, 1],
+            "integration_types": [1, 0],
+        }
+    )
+
+    assert payload["contexts"] is None
+    assert payload["integration_types"] is None
+
+
+@pytest.mark.asyncio
+async def test_safe_sync_records_failed_mutations(monkeypatch):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+    monkeypatch.setattr(
+        DiscordAdapter,
+        "_command_sync_mutation_interval_seconds",
+        lambda self: 0.0,
+    )
+
+    class _DesiredCommand:
+        def to_dict(self, tree):
+            return {
+                "name": "status",
+                "description": "Show Hermes status",
+                "type": 1,
+                "options": [],
+            }
+
+    fake_tree = SimpleNamespace(
+        get_commands=lambda: [_DesiredCommand()],
+        fetch_commands=AsyncMock(return_value=[]),
+    )
+
+    async def _boom(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    fake_http = SimpleNamespace(
+        upsert_global_command=_boom,
+        edit_global_command=AsyncMock(),
+        delete_global_command=AsyncMock(),
+    )
+    adapter._client = SimpleNamespace(
+        tree=fake_tree,
+        http=fake_http,
+        application_id=999,
+        user=SimpleNamespace(id=999),
+    )
+
+    summary = await adapter._safe_sync_slash_commands()
+
+    assert summary["created"] == 0
+    assert summary["failed"] == 1
+    assert summary["failed_targets"] == ["status"]
+    assert summary["failed_ops"] == ["create"]
+    assert summary["failed_steps"] == ["upsert_global_command"]
