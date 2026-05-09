@@ -371,7 +371,13 @@ class ByteRoverMemoryProvider(MemoryProvider):
         result = _run_brv(["status"], timeout=15, cwd=self._cwd)
         if not result["success"]:
             return tool_error(result.get("error", "Status check failed"))
-        return json.dumps({"status": result.get("output", "")})
+        canonical_cwd = self._cwd or str(_get_brv_cwd())
+        # 生の brv status はそのまま残しつつ、Hermes 側の正本 project を明示する。
+        return json.dumps({
+            "status": result.get("output", ""),
+            "canonical_cwd": canonical_cwd,
+            "project_path": canonical_cwd,
+        })
 
 
 # ---------------------------------------------------------------------------

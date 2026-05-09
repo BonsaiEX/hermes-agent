@@ -31,6 +31,9 @@ echo "BRV_API_KEY=your-key" >> ~/.hermes/.env
 | `BRV_API_KEY` | No | Cloud sync key (optional, local-first by default) |
 
 Working directory: `$HERMES_HOME/byterover/` (profile-scoped).
+The Hermes provider always runs `brv` from that directory, so the active ByteRover project does not depend on where Hermes itself was launched.
+Running raw `brv` from another directory may inspect a different ByteRover project.
+For manual inspection in this local environment, use the configured helper `hbrv`.
 
 ## Tools
 
