@@ -292,6 +292,52 @@ async def test_plugin_command_name_conflict_skipped(adapter):
     )
 
 
+@pytest.mark.asyncio
+async def test_run_simple_slash_edits_original_response_from_message_handler(adapter):
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(name="Tester", id=42),
+        channel=SimpleNamespace(id=123),
+        channel_id=123,
+        guild_id=999,
+        response=SimpleNamespace(defer=AsyncMock()),
+        followup=SimpleNamespace(send=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+    )
+    adapter._message_handler = AsyncMock(return_value="Hello from Hermes")
+    adapter._build_slash_event = MagicMock(return_value=SimpleNamespace())
+
+    await adapter._run_simple_slash(interaction, "/status")
+
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    adapter._message_handler.assert_awaited_once()
+    interaction.edit_original_response.assert_awaited_once_with(content="Hello from Hermes")
+    interaction.delete_original_response.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_simple_slash_reports_dispatch_error(adapter):
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(name="Tester", id=42),
+        channel=SimpleNamespace(id=123),
+        channel_id=123,
+        guild_id=999,
+        response=SimpleNamespace(defer=AsyncMock()),
+        followup=SimpleNamespace(send=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+    )
+    adapter._message_handler = AsyncMock(side_effect=RuntimeError("dispatch failed"))
+    adapter._build_slash_event = MagicMock(return_value=SimpleNamespace())
+
+    await adapter._run_simple_slash(interaction, "/status")
+
+    interaction.edit_original_response.assert_awaited_once_with(
+        content="処理中にエラーが発生しました。ログを確認してください。"
+    )
+    interaction.delete_original_response.assert_not_awaited()
+
+
 # ------------------------------------------------------------------
 # _handle_thread_create_slash — success, session dispatch, failure
 # ------------------------------------------------------------------
@@ -980,4 +1026,3 @@ def test_register_skill_command_autocomplete_filters_by_name_and_description(ada
     # (covered in other tests). The autocomplete filter itself is exercised
     # via direct function call in the real-discord integration path.
     assert skill_cmd.callback is not None
-
