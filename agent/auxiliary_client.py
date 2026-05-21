@@ -182,6 +182,11 @@ def _normalize_aux_provider(provider: Optional[str]) -> str:
     return _PROVIDER_ALIASES.get(normalized, normalized)
 
 
+def _is_main_aux_provider(provider: Optional[str]) -> bool:
+    """True when an auxiliary task should use the main-runtime fallback mode."""
+    return (provider or "").strip().lower() == "main"
+
+
 # Sentinel: when returned by _fixed_temperature_for_model(), callers must
 # strip the ``temperature`` key from API kwargs entirely so the provider's
 # server-side default applies.  Kimi/Moonshot models manage temperature
@@ -1949,6 +1954,144 @@ def _refresh_provider_credentials(provider: str) -> bool:
     return False
 
 
+def _read_top_level_fallback_chain() -> List[Dict[str, Any]]:
+    """Read the normalized top-level fallback chain from config.yaml."""
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.fallback_cmd import _read_chain
+
+        config = load_config()
+        if not isinstance(config, dict):
+            return []
+        return _read_chain(config)
+    except Exception as exc:
+        logger.debug("Could not read top-level fallback chain: %s", exc)
+        return []
+
+
+def _resolve_main_provider_target(
+    main_runtime: Optional[Dict[str, Any]] = None,
+    model_override: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Resolve the active main-runtime target for auxiliary ``provider: main``."""
+    runtime = _normalize_main_runtime(main_runtime)
+    main_provider = (runtime.get("provider") or _read_main_provider() or "").strip()
+    main_model = (model_override or runtime.get("model") or _read_main_model() or "").strip()
+    main_base_url = (runtime.get("base_url") or "").strip()
+    main_api_key = (runtime.get("api_key") or "").strip()
+    main_api_mode = (runtime.get("api_mode") or "").strip() or None
+
+    if not main_provider or main_provider in ("auto", "main") or not main_model:
+        return None, None, None, None, None
+
+    if main_base_url and (main_provider == "custom" or main_provider.startswith("custom:")):
+        return "custom", main_model, main_base_url, main_api_key or None, main_api_mode
+
+    return main_provider, main_model, None, None, main_api_mode
+
+
+def _is_server_overload_error(exc: Exception) -> bool:
+    """Detect retryable upstream 5xx / overload errors for auxiliary fallback."""
+    status = getattr(exc, "status_code", None)
+    if status in (502, 503, 504, 529):
+        return True
+    err_lower = str(exc).lower()
+    if any(kw in err_lower for kw in (
+        "service unavailable",
+        "service_unavailable_error",
+        "server overload",
+        "temporarily overloaded",
+        "gateway timeout",
+        "bad gateway",
+    )):
+        return True
+    if "error code: 503" in err_lower or "error code: 504" in err_lower:
+        return True
+    return False
+
+
+def _try_main_fallback_chain(
+    *,
+    task: str = None,
+    reason: str,
+    failed_provider: str,
+    failed_model: Optional[str],
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[Any], Optional[str], Optional[Dict[str, Any]]]:
+    """Try the top-level fallback chain for auxiliary ``provider: main`` calls."""
+    chain = _read_top_level_fallback_chain()
+    if not chain:
+        logger.warning(
+            "Auxiliary %s: %s on main provider %s (%s) but no top-level fallback chain is configured",
+            task or "call", reason, failed_provider, failed_model or "default",
+        )
+        return None, None, None
+
+    primary_provider, primary_model, primary_base_url, _primary_api_key, _primary_api_mode = (
+        _resolve_main_provider_target(main_runtime=main_runtime, model_override=failed_model)
+    )
+    tried = []
+    for idx, entry in enumerate(chain, 1):
+        fb_provider = str(entry.get("provider") or "").strip()
+        fb_model = str(entry.get("model") or "").strip()
+        fb_base_url = str(entry.get("base_url") or "").strip() or None
+        fb_api_key = str(entry.get("api_key") or "").strip() or None
+        fb_api_mode = str(entry.get("api_mode") or "").strip() or None
+        if not fb_provider or not fb_model:
+            continue
+
+        normalized_fb_provider = _normalize_aux_provider(fb_provider)
+        normalized_primary_provider = _normalize_aux_provider(primary_provider)
+        if (
+            normalized_fb_provider == normalized_primary_provider
+            and fb_model == (primary_model or "")
+            and (fb_base_url or "") == (primary_base_url or "")
+        ):
+            logger.info(
+                "Auxiliary %s: skipping top-level fallback #%d because it matches the main primary (%s)",
+                task or "call", idx, fb_model,
+            )
+            continue
+
+        client, resolved_model = resolve_provider_client(
+            fb_provider,
+            fb_model,
+            explicit_base_url=fb_base_url,
+            explicit_api_key=fb_api_key,
+            api_mode=fb_api_mode,
+            main_runtime=main_runtime,
+        )
+        tried.append(f"{fb_provider}:{fb_model}")
+        if client is None:
+            logger.warning(
+                "Auxiliary %s: top-level fallback #%d unavailable: %s (%s)",
+                task or "call", idx, fb_provider, fb_model,
+            )
+            continue
+
+        logger.info(
+            "Auxiliary %s: %s on main provider %s (%s) — falling back to top-level #%d: %s (%s)",
+            task or "call",
+            reason,
+            failed_provider,
+            failed_model or "default",
+            idx,
+            fb_provider,
+            resolved_model or fb_model,
+        )
+        return client, resolved_model or fb_model, dict(entry)
+
+    logger.warning(
+        "Auxiliary %s: %s on main provider %s (%s) and no top-level fallback succeeded (tried: %s)",
+        task or "call",
+        reason,
+        failed_provider,
+        failed_model or "default",
+        ", ".join(tried) or "none",
+    )
+    return None, None, None
+
+
 def _try_payment_fallback(
     failed_provider: str,
     task: str = None,
@@ -2212,6 +2355,26 @@ def resolve_provider_client(
         (client, resolved_model) or (None, None) if auth is unavailable.
     """
     _validate_proxy_env_urls()
+    if _is_main_aux_provider(provider):
+        target_provider, target_model, target_base_url, target_api_key, target_api_mode = (
+            _resolve_main_provider_target(main_runtime=main_runtime, model_override=model)
+        )
+        if not target_provider or not target_model:
+            logger.warning(
+                "resolve_provider_client: main requested but no active main provider/model is configured"
+            )
+            return None, None
+        return resolve_provider_client(
+            target_provider,
+            target_model,
+            async_mode=async_mode,
+            raw_codex=raw_codex,
+            explicit_base_url=explicit_base_url if explicit_base_url is not None else target_base_url,
+            explicit_api_key=explicit_api_key if explicit_api_key is not None else target_api_key,
+            api_mode=api_mode if api_mode is not None else target_api_mode,
+            main_runtime=main_runtime,
+            is_vision=is_vision,
+        )
     # Preserve the original provider name before alias normalization so a
     # user-declared ``custom_providers`` entry whose name coincidentally
     # matches a built-in alias (e.g. user names their custom provider "kimi"
@@ -3032,7 +3195,11 @@ def _client_cache_key(
     is_vision: bool = False,
 ) -> tuple:
     runtime = _normalize_main_runtime(main_runtime)
-    runtime_key = tuple(runtime.get(field, "") for field in _MAIN_RUNTIME_FIELDS) if provider == "auto" else ()
+    runtime_key = (
+        tuple(runtime.get(field, "") for field in _MAIN_RUNTIME_FIELDS)
+        if provider in ("auto", "main")
+        else ()
+    )
     return (provider, async_mode, base_url or "", api_key or "", api_mode or "", runtime_key, is_vision)
 
 
@@ -3365,6 +3532,8 @@ def _resolve_task_provider_model(
             # the provider so it can resolve credentials from env vars
             # (e.g. OPENROUTER_API_KEY) instead of locking into "custom".
             return cfg_provider, resolved_model, cfg_base_url, None, resolved_api_mode
+        if _is_main_aux_provider(cfg_provider):
+            return "main", resolved_model, None, None, resolved_api_mode
         if cfg_provider and cfg_provider != "auto":
             return cfg_provider, resolved_model, None, None, resolved_api_mode
 
@@ -3876,16 +4045,58 @@ def call_llm(
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
+            or _is_server_overload_error(first_err)
         )
         # Only try alternative providers when the user didn't explicitly
         # configure this task's provider.  Explicit provider = hard constraint;
         # auto (the default) = best-effort fallback chain.  (#7559)
         is_auto = resolved_provider in ("auto", "", None)
+        is_main = _is_main_aux_provider(resolved_provider)
+        if should_fallback and is_main:
+            if _is_payment_error(first_err):
+                reason = "payment error"
+            elif _is_rate_limit_error(first_err):
+                reason = "rate limit"
+            elif _is_server_overload_error(first_err):
+                reason = "server overload"
+            else:
+                reason = "connection error"
+            logger.info(
+                "Auxiliary %s: %s on main provider (%s), trying top-level fallback chain",
+                task or "call", reason, first_err,
+            )
+            fb_client, fb_model, fb_entry = _try_main_fallback_chain(
+                task=task,
+                reason=reason,
+                failed_provider=_read_main_provider() or resolved_provider,
+                failed_model=final_model or resolved_model,
+                main_runtime=main_runtime,
+            )
+            if fb_client is not None and fb_entry is not None:
+                fb_provider = str(fb_entry.get("provider") or "").strip()
+                fb_base_url = str(getattr(fb_client, "base_url", "") or fb_entry.get("base_url") or "")
+                fb_kwargs = _build_call_kwargs(
+                    fb_provider,
+                    fb_model,
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    timeout=effective_timeout,
+                    extra_body=effective_extra_body,
+                    base_url=fb_base_url,
+                )
+                if _is_anthropic_compat_endpoint(fb_provider, fb_base_url):
+                    fb_kwargs["messages"] = _convert_openai_images_to_anthropic(fb_kwargs["messages"])
+                return _validate_llm_response(
+                    fb_client.chat.completions.create(**fb_kwargs), task)
         if should_fallback and is_auto:
             if _is_payment_error(first_err):
                 reason = "payment error"
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
+            elif _is_server_overload_error(first_err):
+                reason = "server overload"
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
@@ -4174,13 +4385,55 @@ async def async_call_llm(
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
+            or _is_server_overload_error(first_err)
         )
         is_auto = resolved_provider in ("auto", "", None)
+        is_main = _is_main_aux_provider(resolved_provider)
+        if should_fallback and is_main:
+            if _is_payment_error(first_err):
+                reason = "payment error"
+            elif _is_rate_limit_error(first_err):
+                reason = "rate limit"
+            elif _is_server_overload_error(first_err):
+                reason = "server overload"
+            else:
+                reason = "connection error"
+            logger.info(
+                "Auxiliary %s (async): %s on main provider (%s), trying top-level fallback chain",
+                task or "call", reason, first_err,
+            )
+            fb_client, fb_model, fb_entry = _try_main_fallback_chain(
+                task=task,
+                reason=reason,
+                failed_provider=_read_main_provider() or resolved_provider,
+                failed_model=final_model or resolved_model,
+            )
+            if fb_client is not None and fb_entry is not None:
+                fb_provider = str(fb_entry.get("provider") or "").strip()
+                fb_base_url = str(getattr(fb_client, "base_url", "") or fb_entry.get("base_url") or "")
+                fb_kwargs = _build_call_kwargs(
+                    fb_provider, fb_model, messages,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, timeout=effective_timeout,
+                    extra_body=effective_extra_body,
+                    base_url=fb_base_url,
+                )
+                async_fb, async_fb_model = _to_async_client(
+                    fb_client, fb_model or "", is_vision=(task == "vision")
+                )
+                if _is_anthropic_compat_endpoint(fb_provider, fb_base_url):
+                    fb_kwargs["messages"] = _convert_openai_images_to_anthropic(fb_kwargs["messages"])
+                if async_fb_model and async_fb_model != fb_kwargs.get("model"):
+                    fb_kwargs["model"] = async_fb_model
+                return _validate_llm_response(
+                    await async_fb.chat.completions.create(**fb_kwargs), task)
         if should_fallback and is_auto:
             if _is_payment_error(first_err):
                 reason = "payment error"
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
+            elif _is_server_overload_error(first_err):
+                reason = "server overload"
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",

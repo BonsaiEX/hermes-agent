@@ -24,6 +24,7 @@ from agent.auxiliary_client import (
     _is_payment_error,
     _is_rate_limit_error,
     _normalize_aux_provider,
+    _resolve_task_provider_model,
     _try_payment_fallback,
     _resolve_auto,
     _CodexCompletionsAdapter,
@@ -991,6 +992,93 @@ class TestCallLlmPaymentFallback:
             )
         # Fallback client should have been used
         assert fallback_client.chat.completions.create.called
+
+    def test_main_provider_503_uses_top_level_fallback_chain(self):
+        """provider=main should use top-level fallback_providers on 503 errors."""
+        primary_client = MagicMock()
+        server_err = Exception("Service Unavailable")
+        server_err.status_code = 503
+        primary_client.chat.completions.create.side_effect = server_err
+
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="main fallback response"))
+        ])
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "deepseek-v4-flash"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("main", "deepseek-v4-flash", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._try_main_fallback_chain",
+            return_value=(fallback_client, "qwen3.6-plus", {"provider": "opencode-go", "model": "qwen3.6-plus"}),
+        ) as mock_main_fb, patch(
+            "agent.auxiliary_client._try_payment_fallback"
+        ) as mock_auto_fb, patch(
+            "agent.auxiliary_client._read_main_provider",
+            return_value="opencode-go",
+        ):
+            result = call_llm(
+                task="title_generation",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert result is not None
+        assert mock_main_fb.called
+        assert not mock_auto_fb.called
+        assert fallback_client.chat.completions.create.called
+
+    def test_explicit_provider_503_does_not_use_top_level_fallback_chain(self):
+        """Explicit providers stay hard-constrained even on 503 errors."""
+        primary_client = MagicMock()
+        server_err = Exception("Service Unavailable")
+        server_err.status_code = 503
+        primary_client.chat.completions.create.side_effect = server_err
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "deepseek-v4-flash"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("opencode-go", "deepseek-v4-flash", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._try_main_fallback_chain"
+        ) as mock_main_fb, patch(
+            "agent.auxiliary_client._try_payment_fallback"
+        ) as mock_auto_fb:
+            with pytest.raises(Exception, match="Service Unavailable"):
+                call_llm(
+                    task="title_generation",
+                    messages=[{"role": "user", "content": "hello"}],
+                )
+
+        assert not mock_main_fb.called
+        assert not mock_auto_fb.called
+
+
+def test_resolve_task_provider_model_keeps_main_mode_from_config():
+    """Config-driven provider=main must stay literal so call_llm can special-case it."""
+    config = {
+        "auxiliary": {
+            "title_generation": {
+                "provider": "main",
+                "model": "",
+                "base_url": "",
+                "api_key": "",
+            }
+        }
+    }
+
+    with patch("hermes_cli.config.load_config", return_value=config):
+        provider, model, base_url, api_key, api_mode = _resolve_task_provider_model("title_generation")
+
+    assert provider == "main"
+    assert model is None
+    assert base_url is None
+    assert api_key is None
+    assert api_mode is None
 
 # ---------------------------------------------------------------------------
 # Gate: _resolve_api_key_provider must skip anthropic when not configured
