@@ -1954,40 +1954,59 @@ def _refresh_provider_credentials(provider: str) -> bool:
     return False
 
 
+def _normalize_fallback_chain(raw_chain: Any) -> List[Dict[str, Any]]:
+    """Normalize fallback chain config to a list of ``{provider, model, ...}`` dicts."""
+    try:
+        from hermes_cli.fallback_cmd import _read_chain
+
+        return _read_chain({"fallback_providers": raw_chain})
+    except Exception as exc:
+        logger.debug("Could not normalize fallback chain: %s", exc)
+        return []
+
+
 def _read_top_level_fallback_chain() -> List[Dict[str, Any]]:
     """Read the normalized top-level fallback chain from config.yaml."""
     try:
         from hermes_cli.config import load_config
-        from hermes_cli.fallback_cmd import _read_chain
 
         config = load_config()
         if not isinstance(config, dict):
             return []
-        return _read_chain(config)
+        return _normalize_fallback_chain(config.get("fallback_providers") or config.get("fallback_model"))
     except Exception as exc:
         logger.debug("Could not read top-level fallback chain: %s", exc)
         return []
 
 
-def _resolve_main_provider_target(
+def _resolve_provider_target(
+    provider: Optional[str],
     main_runtime: Optional[Dict[str, Any]] = None,
     model_override: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
-    """Resolve the active main-runtime target for auxiliary ``provider: main``."""
+    """Resolve the effective target for an auxiliary provider configuration."""
+    provider = (provider or "").strip()
     runtime = _normalize_main_runtime(main_runtime)
-    main_provider = (runtime.get("provider") or _read_main_provider() or "").strip()
-    main_model = (model_override or runtime.get("model") or _read_main_model() or "").strip()
-    main_base_url = (runtime.get("base_url") or "").strip()
-    main_api_key = (runtime.get("api_key") or "").strip()
-    main_api_mode = (runtime.get("api_mode") or "").strip() or None
+    if _is_main_aux_provider(provider):
+        provider = (runtime.get("provider") or _read_main_provider() or "").strip()
+        model = (model_override or runtime.get("model") or _read_main_model() or "").strip()
+        base_url = (runtime.get("base_url") or "").strip()
+        api_key = (runtime.get("api_key") or "").strip()
+        api_mode = (runtime.get("api_mode") or "").strip() or None
+    else:
+        provider = _normalize_aux_provider(provider)
+        model = (model_override or "").strip()
+        base_url = ""
+        api_key = ""
+        api_mode = None
 
-    if not main_provider or main_provider in ("auto", "main") or not main_model:
+    if not provider or provider in ("auto", "main") or not model:
         return None, None, None, None, None
 
-    if main_base_url and (main_provider == "custom" or main_provider.startswith("custom:")):
-        return "custom", main_model, main_base_url, main_api_key or None, main_api_mode
+    if base_url and (provider == "custom" or provider.startswith("custom:")):
+        return "custom", model, base_url, api_key or None, api_mode
 
-    return main_provider, main_model, None, None, main_api_mode
+    return provider, model, None, None, api_mode
 
 
 def _is_server_overload_error(exc: Exception) -> bool:
@@ -2010,25 +2029,27 @@ def _is_server_overload_error(exc: Exception) -> bool:
     return False
 
 
-def _try_main_fallback_chain(
+def _try_configured_fallback_chain(
     *,
     task: str = None,
+    chain: List[Dict[str, Any]],
+    chain_name: str,
     reason: str,
     failed_provider: str,
     failed_model: Optional[str],
+    primary_provider: Optional[str],
     main_runtime: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], Optional[Dict[str, Any]]]:
-    """Try the top-level fallback chain for auxiliary ``provider: main`` calls."""
-    chain = _read_top_level_fallback_chain()
+    """Try a configured fallback chain for an auxiliary task."""
     if not chain:
         logger.warning(
-            "Auxiliary %s: %s on main provider %s (%s) but no top-level fallback chain is configured",
-            task or "call", reason, failed_provider, failed_model or "default",
+            "Auxiliary %s: %s on %s (%s) but %s is empty",
+            task or "call", reason, failed_provider, failed_model or "default", chain_name,
         )
         return None, None, None
 
     primary_provider, primary_model, primary_base_url, _primary_api_key, _primary_api_mode = (
-        _resolve_main_provider_target(main_runtime=main_runtime, model_override=failed_model)
+        _resolve_provider_target(primary_provider, main_runtime=main_runtime, model_override=failed_model)
     )
     tried = []
     for idx, entry in enumerate(chain, 1):
@@ -2048,8 +2069,8 @@ def _try_main_fallback_chain(
             and (fb_base_url or "") == (primary_base_url or "")
         ):
             logger.info(
-                "Auxiliary %s: skipping top-level fallback #%d because it matches the main primary (%s)",
-                task or "call", idx, fb_model,
+                "Auxiliary %s: skipping %s #%d because it matches the primary (%s)",
+                task or "call", chain_name, idx, fb_model,
             )
             continue
 
@@ -2064,17 +2085,18 @@ def _try_main_fallback_chain(
         tried.append(f"{fb_provider}:{fb_model}")
         if client is None:
             logger.warning(
-                "Auxiliary %s: top-level fallback #%d unavailable: %s (%s)",
-                task or "call", idx, fb_provider, fb_model,
+                "Auxiliary %s: %s #%d unavailable: %s (%s)",
+                task or "call", chain_name, idx, fb_provider, fb_model,
             )
             continue
 
         logger.info(
-            "Auxiliary %s: %s on main provider %s (%s) — falling back to top-level #%d: %s (%s)",
+            "Auxiliary %s: %s on %s (%s) — falling back via %s #%d: %s (%s)",
             task or "call",
             reason,
             failed_provider,
             failed_model or "default",
+            chain_name,
             idx,
             fb_provider,
             resolved_model or fb_model,
@@ -2082,11 +2104,12 @@ def _try_main_fallback_chain(
         return client, resolved_model or fb_model, dict(entry)
 
     logger.warning(
-        "Auxiliary %s: %s on main provider %s (%s) and no top-level fallback succeeded (tried: %s)",
+        "Auxiliary %s: %s on %s (%s) and no %s entry succeeded (tried: %s)",
         task or "call",
         reason,
         failed_provider,
         failed_model or "default",
+        chain_name,
         ", ".join(tried) or "none",
     )
     return None, None, None
@@ -2357,7 +2380,7 @@ def resolve_provider_client(
     _validate_proxy_env_urls()
     if _is_main_aux_provider(provider):
         target_provider, target_model, target_base_url, target_api_key, target_api_mode = (
-            _resolve_main_provider_target(main_runtime=main_runtime, model_override=model)
+            _resolve_provider_target(provider, main_runtime=main_runtime, model_override=model)
         )
         if not target_provider or not target_model:
             logger.warning(
@@ -3559,6 +3582,12 @@ def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
     return task_config if isinstance(task_config, dict) else {}
 
 
+def _get_task_fallback_chain(task: str) -> List[Dict[str, Any]]:
+    """Read auxiliary.<task>.fallback_providers, normalized to the standard list format."""
+    task_config = _get_auxiliary_task_config(task)
+    return _normalize_fallback_chain(task_config.get("fallback_providers"))
+
+
 def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float:
     """Read timeout from auxiliary.{task}.timeout in config, falling back to *default*."""
     if not task:
@@ -3580,6 +3609,18 @@ def _get_task_extra_body(task: str) -> Dict[str, Any]:
     if isinstance(raw, dict):
         return dict(raw)
     return {}
+
+
+def _merge_fallback_extra_body(
+    base_extra_body: Dict[str, Any],
+    fallback_entry: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Merge per-task extra_body with fallback-entry extra_body overrides."""
+    merged = dict(base_extra_body or {})
+    entry_extra = (fallback_entry or {}).get("extra_body")
+    if isinstance(entry_extra, dict):
+        merged.update(entry_extra)
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -3814,6 +3855,7 @@ def call_llm(
         task, provider, model, base_url, api_key)
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+    task_fallback_chain = _get_task_fallback_chain(task)
 
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(
@@ -4052,7 +4094,49 @@ def call_llm(
         # auto (the default) = best-effort fallback chain.  (#7559)
         is_auto = resolved_provider in ("auto", "", None)
         is_main = _is_main_aux_provider(resolved_provider)
-        if should_fallback and is_main:
+        if should_fallback and task_fallback_chain and not is_auto:
+            if _is_payment_error(first_err):
+                reason = "payment error"
+            elif _is_rate_limit_error(first_err):
+                reason = "rate limit"
+            elif _is_server_overload_error(first_err):
+                reason = "server overload"
+            else:
+                reason = "connection error"
+            logger.info(
+                "Auxiliary %s: %s on %s (%s), trying task fallback chain",
+                task or "call", reason, resolved_provider, first_err,
+            )
+            fb_client, fb_model, fb_entry = _try_configured_fallback_chain(
+                task=task,
+                chain=task_fallback_chain,
+                chain_name="task fallback",
+                reason=reason,
+                failed_provider=(_read_main_provider() or resolved_provider) if is_main else resolved_provider,
+                failed_model=final_model or resolved_model,
+                primary_provider="main" if is_main else resolved_provider,
+                main_runtime=main_runtime,
+            )
+            if fb_client is not None and fb_entry is not None:
+                fb_provider = str(fb_entry.get("provider") or "").strip()
+                fb_base_url = str(getattr(fb_client, "base_url", "") or fb_entry.get("base_url") or "")
+                fb_extra_body = _merge_fallback_extra_body(effective_extra_body, fb_entry)
+                fb_kwargs = _build_call_kwargs(
+                    fb_provider,
+                    fb_model,
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    timeout=effective_timeout,
+                    extra_body=fb_extra_body,
+                    base_url=fb_base_url,
+                )
+                if _is_anthropic_compat_endpoint(fb_provider, fb_base_url):
+                    fb_kwargs["messages"] = _convert_openai_images_to_anthropic(fb_kwargs["messages"])
+                return _validate_llm_response(
+                    fb_client.chat.completions.create(**fb_kwargs), task)
+        if should_fallback and is_main and not task_fallback_chain:
             if _is_payment_error(first_err):
                 reason = "payment error"
             elif _is_rate_limit_error(first_err):
@@ -4065,16 +4149,20 @@ def call_llm(
                 "Auxiliary %s: %s on main provider (%s), trying top-level fallback chain",
                 task or "call", reason, first_err,
             )
-            fb_client, fb_model, fb_entry = _try_main_fallback_chain(
+            fb_client, fb_model, fb_entry = _try_configured_fallback_chain(
                 task=task,
+                chain=_read_top_level_fallback_chain(),
+                chain_name="top-level fallback",
                 reason=reason,
                 failed_provider=_read_main_provider() or resolved_provider,
                 failed_model=final_model or resolved_model,
+                primary_provider="main",
                 main_runtime=main_runtime,
             )
             if fb_client is not None and fb_entry is not None:
                 fb_provider = str(fb_entry.get("provider") or "").strip()
                 fb_base_url = str(getattr(fb_client, "base_url", "") or fb_entry.get("base_url") or "")
+                fb_extra_body = _merge_fallback_extra_body(effective_extra_body, fb_entry)
                 fb_kwargs = _build_call_kwargs(
                     fb_provider,
                     fb_model,
@@ -4083,7 +4171,7 @@ def call_llm(
                     max_tokens=max_tokens,
                     tools=tools,
                     timeout=effective_timeout,
-                    extra_body=effective_extra_body,
+                    extra_body=fb_extra_body,
                     base_url=fb_base_url,
                 )
                 if _is_anthropic_compat_endpoint(fb_provider, fb_base_url):
@@ -4193,6 +4281,7 @@ async def async_call_llm(
         task, provider, model, base_url, api_key)
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+    task_fallback_chain = _get_task_fallback_chain(task)
 
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(
@@ -4389,7 +4478,50 @@ async def async_call_llm(
         )
         is_auto = resolved_provider in ("auto", "", None)
         is_main = _is_main_aux_provider(resolved_provider)
-        if should_fallback and is_main:
+        if should_fallback and task_fallback_chain and not is_auto:
+            if _is_payment_error(first_err):
+                reason = "payment error"
+            elif _is_rate_limit_error(first_err):
+                reason = "rate limit"
+            elif _is_server_overload_error(first_err):
+                reason = "server overload"
+            else:
+                reason = "connection error"
+            logger.info(
+                "Auxiliary %s (async): %s on %s (%s), trying task fallback chain",
+                task or "call", reason, resolved_provider, first_err,
+            )
+            fb_client, fb_model, fb_entry = _try_configured_fallback_chain(
+                task=task,
+                chain=task_fallback_chain,
+                chain_name="task fallback",
+                reason=reason,
+                failed_provider=(_read_main_provider() or resolved_provider) if is_main else resolved_provider,
+                failed_model=final_model or resolved_model,
+                primary_provider="main" if is_main else resolved_provider,
+                main_runtime=main_runtime,
+            )
+            if fb_client is not None and fb_entry is not None:
+                fb_provider = str(fb_entry.get("provider") or "").strip()
+                fb_base_url = str(getattr(fb_client, "base_url", "") or fb_entry.get("base_url") or "")
+                fb_extra_body = _merge_fallback_extra_body(effective_extra_body, fb_entry)
+                fb_kwargs = _build_call_kwargs(
+                    fb_provider, fb_model, messages,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, timeout=effective_timeout,
+                    extra_body=fb_extra_body,
+                    base_url=fb_base_url,
+                )
+                async_fb, async_fb_model = _to_async_client(
+                    fb_client, fb_model or "", is_vision=(task == "vision")
+                )
+                if _is_anthropic_compat_endpoint(fb_provider, fb_base_url):
+                    fb_kwargs["messages"] = _convert_openai_images_to_anthropic(fb_kwargs["messages"])
+                if async_fb_model and async_fb_model != fb_kwargs.get("model"):
+                    fb_kwargs["model"] = async_fb_model
+                return _validate_llm_response(
+                    await async_fb.chat.completions.create(**fb_kwargs), task)
+        if should_fallback and is_main and not task_fallback_chain:
             if _is_payment_error(first_err):
                 reason = "payment error"
             elif _is_rate_limit_error(first_err):
@@ -4402,20 +4534,25 @@ async def async_call_llm(
                 "Auxiliary %s (async): %s on main provider (%s), trying top-level fallback chain",
                 task or "call", reason, first_err,
             )
-            fb_client, fb_model, fb_entry = _try_main_fallback_chain(
+            fb_client, fb_model, fb_entry = _try_configured_fallback_chain(
                 task=task,
+                chain=_read_top_level_fallback_chain(),
+                chain_name="top-level fallback",
                 reason=reason,
                 failed_provider=_read_main_provider() or resolved_provider,
                 failed_model=final_model or resolved_model,
+                primary_provider="main",
+                main_runtime=main_runtime,
             )
             if fb_client is not None and fb_entry is not None:
                 fb_provider = str(fb_entry.get("provider") or "").strip()
                 fb_base_url = str(getattr(fb_client, "base_url", "") or fb_entry.get("base_url") or "")
+                fb_extra_body = _merge_fallback_extra_body(effective_extra_body, fb_entry)
                 fb_kwargs = _build_call_kwargs(
                     fb_provider, fb_model, messages,
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, timeout=effective_timeout,
-                    extra_body=effective_extra_body,
+                    extra_body=fb_extra_body,
                     base_url=fb_base_url,
                 )
                 async_fb, async_fb_model = _to_async_client(

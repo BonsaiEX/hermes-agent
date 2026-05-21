@@ -993,8 +993,87 @@ class TestCallLlmPaymentFallback:
         # Fallback client should have been used
         assert fallback_client.chat.completions.create.called
 
-    def test_main_provider_503_uses_top_level_fallback_chain(self):
-        """provider=main should use top-level fallback_providers on 503 errors."""
+    def test_task_fallback_chain_handles_explicit_provider_503(self):
+        """Explicit providers may use auxiliary.<task>.fallback_providers when configured."""
+        primary_client = MagicMock()
+        server_err = Exception("Service Unavailable")
+        server_err.status_code = 503
+        primary_client.chat.completions.create.side_effect = server_err
+
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="task fallback response"))
+        ])
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "deepseek-v4-flash"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("opencode-go", "deepseek-v4-flash", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._get_task_fallback_chain",
+            return_value=[{"provider": "opencode-go", "model": "qwen3.6-plus"}],
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(fallback_client, "qwen3.6-plus", {"provider": "opencode-go", "model": "qwen3.6-plus"}),
+        ) as mock_cfg_fb, patch(
+            "agent.auxiliary_client._try_payment_fallback"
+        ) as mock_auto_fb, patch(
+            "agent.auxiliary_client._read_main_provider",
+            return_value="opencode-go",
+        ):
+            result = call_llm(
+                task="title_generation",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert result is not None
+        assert mock_cfg_fb.called
+        assert not mock_auto_fb.called
+        assert fallback_client.chat.completions.create.called
+
+    def test_task_fallback_chain_beats_top_level_main_fallback(self):
+        """auxiliary.<task>.fallback_providers should win over provider=main top-level fallback."""
+        primary_client = MagicMock()
+        server_err = Exception("Service Unavailable")
+        server_err.status_code = 503
+        primary_client.chat.completions.create.side_effect = server_err
+
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="task fallback response"))
+        ])
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "deepseek-v4-flash"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("main", "deepseek-v4-flash", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._get_task_fallback_chain",
+            return_value=[{"provider": "opencode-go", "model": "qwen3.6-plus"}],
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(fallback_client, "qwen3.6-plus", {"provider": "opencode-go", "model": "qwen3.6-plus"}),
+        ) as mock_cfg_fb, patch(
+            "agent.auxiliary_client._read_top_level_fallback_chain"
+        ) as mock_top_level, patch(
+            "agent.auxiliary_client._try_payment_fallback"
+        ) as mock_auto_fb:
+            result = call_llm(
+                task="title_generation",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert result is not None
+        assert mock_cfg_fb.called
+        assert not mock_top_level.called
+        assert not mock_auto_fb.called
+
+    def test_main_provider_503_uses_top_level_fallback_chain_without_task_chain(self):
+        """provider=main should use top-level fallback_providers when no task chain exists."""
         primary_client = MagicMock()
         server_err = Exception("Service Unavailable")
         server_err.status_code = 503
@@ -1012,9 +1091,15 @@ class TestCallLlmPaymentFallback:
             "agent.auxiliary_client._resolve_task_provider_model",
             return_value=("main", "deepseek-v4-flash", None, None, None),
         ), patch(
-            "agent.auxiliary_client._try_main_fallback_chain",
+            "agent.auxiliary_client._get_task_fallback_chain",
+            return_value=[],
+        ), patch(
+            "agent.auxiliary_client._read_top_level_fallback_chain",
+            return_value=[{"provider": "opencode-go", "model": "qwen3.6-plus"}],
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
             return_value=(fallback_client, "qwen3.6-plus", {"provider": "opencode-go", "model": "qwen3.6-plus"}),
-        ) as mock_main_fb, patch(
+        ) as mock_cfg_fb, patch(
             "agent.auxiliary_client._try_payment_fallback"
         ) as mock_auto_fb, patch(
             "agent.auxiliary_client._read_main_provider",
@@ -1026,9 +1111,8 @@ class TestCallLlmPaymentFallback:
             )
 
         assert result is not None
-        assert mock_main_fb.called
+        assert mock_cfg_fb.called
         assert not mock_auto_fb.called
-        assert fallback_client.chat.completions.create.called
 
     def test_explicit_provider_503_does_not_use_top_level_fallback_chain(self):
         """Explicit providers stay hard-constrained even on 503 errors."""
@@ -1044,8 +1128,11 @@ class TestCallLlmPaymentFallback:
             "agent.auxiliary_client._resolve_task_provider_model",
             return_value=("opencode-go", "deepseek-v4-flash", None, None, None),
         ), patch(
-            "agent.auxiliary_client._try_main_fallback_chain"
-        ) as mock_main_fb, patch(
+            "agent.auxiliary_client._get_task_fallback_chain",
+            return_value=[],
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain"
+        ) as mock_cfg_fb, patch(
             "agent.auxiliary_client._try_payment_fallback"
         ) as mock_auto_fb:
             with pytest.raises(Exception, match="Service Unavailable"):
@@ -1054,8 +1141,43 @@ class TestCallLlmPaymentFallback:
                     messages=[{"role": "user", "content": "hello"}],
                 )
 
-        assert not mock_main_fb.called
+        assert not mock_cfg_fb.called
         assert not mock_auto_fb.called
+
+    def test_auto_provider_keeps_existing_fallback_path(self):
+        """provider=auto should keep using the existing auto fallback path."""
+        primary_client = MagicMock()
+        rate_err = self._make_429_rate_limit_error()
+        primary_client.chat.completions.create.side_effect = rate_err
+
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="auto fallback response"))
+        ])
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "deepseek-v4-flash"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", "deepseek-v4-flash", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._get_task_fallback_chain",
+            return_value=[{"provider": "opencode-go", "model": "qwen3.6-plus"}],
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain"
+        ) as mock_cfg_fb, patch(
+            "agent.auxiliary_client._try_payment_fallback",
+            return_value=(fallback_client, "fallback-model", "openrouter"),
+        ) as mock_auto_fb:
+            result = call_llm(
+                task="title_generation",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert result is not None
+        assert not mock_cfg_fb.called
+        assert mock_auto_fb.called
 
 
 def test_resolve_task_provider_model_keeps_main_mode_from_config():
@@ -1079,6 +1201,26 @@ def test_resolve_task_provider_model_keeps_main_mode_from_config():
     assert base_url is None
     assert api_key is None
     assert api_mode is None
+
+
+def test_get_task_fallback_chain_reads_auxiliary_config():
+    """Task-level fallback_providers should normalize to the standard chain format."""
+    from agent.auxiliary_client import _get_task_fallback_chain
+
+    config = {
+        "auxiliary": {
+            "title_generation": {
+                "fallback_providers": [
+                    {"provider": "opencode-go", "model": "qwen3.6-plus"},
+                ]
+            }
+        }
+    }
+
+    with patch("hermes_cli.config.load_config", return_value=config):
+        chain = _get_task_fallback_chain("title_generation")
+
+    assert chain == [{"provider": "opencode-go", "model": "qwen3.6-plus"}]
 
 # ---------------------------------------------------------------------------
 # Gate: _resolve_api_key_provider must skip anthropic when not configured
