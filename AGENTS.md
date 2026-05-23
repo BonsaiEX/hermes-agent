@@ -13,6 +13,31 @@ source .venv/bin/activate   # or: source venv/bin/activate
 `$HOME/.hermes/hermes-agent/venv` (for worktrees that share a venv with the
 main checkout).
 
+## Local RTK / Semble Search Policy
+
+This local checkout uses RTK and Semble for token-efficient development work.
+
+- Prefer RTK-wrapped shell commands for terminal work:
+  - `rtk git status`
+  - `rtk git diff`
+  - `rtk git log -n 20`
+  - `rtk npm run build`
+  - `rtk pytest -q`
+  - `rtk scripts/run_tests.sh ...`
+- For semantic or exploratory code search, prefer RTK-wrapped Semble first (external command wrapped by RTK, not necessarily a built-in subcommand):
+  - `rtk semble search "query" .`
+  - `rtk semble find-related <file_path> <line>`
+- For exact literal checks, use RTK-wrapped exact search:
+  - `rtk grep "pattern" .`
+- For file lists, prefer:
+  - `rtk rg --files`
+  - `rtk ls`
+- `rtk find` can be unstable in some environments. If it crashes or behaves incorrectly, use `rtk rg --files`, `rtk ls`, or plain `find` with a brief explanation.
+- Before reading large files, narrow candidates with Semble or exact search.
+- Raw `rg`, `grep`, `find`, `cat`, and broad file reads should be avoided unless full uncompressed output is explicitly needed.
+- If RTK or Semble changes behavior, breaks formatting, is too slow, or harms search quality, fall back to the narrowest plain command and explain why.
+- The Hermes runtime has the `rtk-rewrite` plugin enabled (at `~/.hermes/plugins/rtk-rewrite/`), but this repo guide is for development-agent command selection and search strategy.
+
 ## Project Structure
 
 File counts shift constantly — don't treat the tree below as exhaustive.
